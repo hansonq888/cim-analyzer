@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"const p = require\\(''/c/Users/hanso/OneDrive/Documents/Coding Projects/sagard-project/cim-analyzer/frontend/node_modules/pdfjs-dist/package.json''\\); console.log\\(''pdfjs-dist version:'', p.version\\)\")",
+      "Bash(node -e \"const p = require\\(''/c/Users/hanso/OneDrive/Documents/Coding Projects/sagard-project/cim-analyzer/frontend/node_modules/react-pdf/package.json''\\); console.log\\(''react-pdf version:'', p.version\\); console.log\\(''pdfjs-dist dep:'', p.dependencies[''pdfjs-dist''] || p.peerDependencies[''pdfjs-dist'']\\)\")",
+      "Bash(python -c \"import sys,json; p=json.load\\(sys.stdin\\); print\\(''''pdfjs-dist:'''', p[''''version'''']\\)\")",
+      "Bash(python -c \"import sys,json; p=json.load\\(sys.stdin\\); print\\(''''react-pdf:'''', p[''''version'''']\\); deps=p.get\\(''''dependencies'''',{}\\); peers=p.get\\(''''peerDependencies'''',{}\\); print\\(''''pdfjs dep:'''', deps.get\\(''''pdfjs-dist''''\\) or peers.get\\(''''pdfjs-dist''''\\)\\)\")",
+      "Bash(python -c \"import json; p=open\\(''public/pdf.worker.min.mjs''\\).read\\(\\); print\\(p[:500]\\)\")"
+    ]
+  }
+}
