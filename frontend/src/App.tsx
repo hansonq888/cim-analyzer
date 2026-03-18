@@ -1,4 +1,7 @@
 import { useState, useCallback, useRef, useEffect, useReducer } from "react";
+import { useDealPersistence, Deal } from "./useDealPersistence";
+import type { LoadedDealData } from "./useDealPersistence";
+import { isSupabaseConfigured } from "./supabaseClient";
 import { useDropzone } from "react-dropzone";
 import { Document, Page } from "react-pdf";
 import 'react-pdf/dist/Page/AnnotationLayer.css';
@@ -12,6 +15,69 @@ import {
 } from 'recharts';
 
 const BACKEND_URL = "http://localhost:8000";
+
+// ── IndexedDB file cache ──────────────────────────────────────
+// Persists File binaries across page refreshes, keyed by deal ID.
+const IDB_NAME = 'cim-deal-files';
+const IDB_STORE = 'files';
+
+function openFileDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveFilesToIDB(dealId: string, files: File[]): Promise<void> {
+  if (!files.length) return;
+  try {
+    const db = await openFileDB();
+    const serialized = await Promise.all(
+      files.map(async f => ({ name: f.name, type: f.type, buffer: await f.arrayBuffer() }))
+    );
+    await new Promise<void>((resolve, reject) => {
+      const req = db.transaction(IDB_STORE, 'readwrite').objectStore(IDB_STORE).put(serialized, dealId);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+  } catch (err) {
+    console.warn('[IDB] saveFiles failed:', err);
+  }
+}
+
+async function loadFilesFromIDB(dealId: string): Promise<File[] | null> {
+  try {
+    const db = await openFileDB();
+    const result = await new Promise<any>((resolve, reject) => {
+      const req = db.transaction(IDB_STORE, 'readonly').objectStore(IDB_STORE).get(dealId);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+    if (!result) return null;
+    return (result as any[]).map(f => new File([f.buffer], f.name, { type: f.type }));
+  } catch (err) {
+    console.warn('[IDB] loadFiles failed:', err);
+    return null;
+  }
+}
+
+async function deleteFilesFromIDB(dealId: string): Promise<void> {
+  try {
+    const db = await openFileDB();
+    await new Promise<void>((resolve, reject) => {
+      const req = db.transaction(IDB_STORE, 'readwrite').objectStore(IDB_STORE).delete(dealId);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+    db.close();
+  } catch (err) {
+    console.warn('[IDB] deleteFiles failed:', err);
+  }
+}
 
 // ── Brand ────────────────────────────────────────────────────
 const RED    = "#913d3e";
@@ -64,6 +130,48 @@ interface AnalysisResult {
   charts_data?: any;
   documents_text?: Record<string, string>;
 }
+
+interface CompTransaction {
+  company: string;
+  acquirer: string;
+  date: string;
+  ev_millions: number | null;
+  ev_ebitda: number | null;
+  ev_revenue: number | null;
+  why_comparable: string;
+  key_difference: string;
+  source_url: string | null;
+}
+
+interface CompsData {
+  deal_profile: {
+    sector: string;
+    sub_sector: string;
+    description: string;
+    revenue_millions: number | null;
+    ebitda_millions: number | null;
+    ebitda_margin_pct: number | null;
+    geography: string;
+    business_model: string;
+  };
+  comps: CompTransaction[];
+  sector_context: {
+    typical_ev_ebitda_low: number;
+    typical_ev_ebitda_high: number;
+    multiple_drivers: string[];
+    discount_drivers: string[];
+  };
+  this_deal_positioning: {
+    implied_ev_ebitda: number | null;
+    implied_ev_revenue: number | null;
+    vs_comp_set: string;
+    rationale: string;
+  };
+  valuation_context: string;
+  data_quality_note: string;
+}
+
+type AppView = 'home' | 'deal';
 
 interface TextSegment { type: 'text'; content: string; }
 interface ChartSegment { type: 'chart'; chartData: any; }
@@ -150,14 +258,38 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
+function formatRelativeTime(dateStr: string): string {
+  const date = new Date(dateStr);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+  if (diffMins < 2) return 'just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays === 1) return 'yesterday';
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+const dealVerdictPill: Record<string, { bg: string; color: string; border: string }> = {
+  'Worth deeper look': { bg: '#f0fdf4', color: '#166534', border: '#bbf7d0' },
+  'Borderline':        { bg: '#fffbeb', color: '#92400e', border: '#fde68a' },
+  'Pass':              { bg: '#fdf2f2', color: '#991b1b', border: '#fecaca' },
+};
+
+const FONT_STACK = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+
 const GLOBAL_STYLE = `
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Inter', sans-serif; background: ${OFFWHITE}; color: ${NAVY}; }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; font-family: inherit; }
+  body { font-family: ${FONT_STACK}; background: ${OFFWHITE}; color: ${NAVY}; -webkit-font-smoothing: antialiased; }
   a:hover { opacity: 0.8; }
   textarea:focus { outline: 1px solid ${RED}; border-color: transparent; }
   .react-pdf__Page { display: block !important; }
   input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
+  input, select, textarea, button { font-family: inherit; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes pulse { 0%, 100% { opacity: 0.3; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
 `;
@@ -170,7 +302,7 @@ function formatBytes(b: number) {
 }
 
 const sectionLabel: React.CSSProperties = {
-  fontFamily: "'Inter', sans-serif",
+  fontFamily: FONT_STACK,
   fontSize: 10, fontWeight: 700, color: RED,
   textTransform: "uppercase", letterSpacing: "2px",
 };
@@ -225,11 +357,14 @@ interface UploadZoneProps {
   onSectorChange: (s: string) => void;
   criteria: InvestmentCriteria;
   onCriteriaChange: (c: InvestmentCriteria) => void;
+  dealName?: string;
+  onBackToHome?: () => void;
 }
 
 function UploadZone({
   files, onAddFiles, onRemoveFile, onAnalyze, loading, loadingStep,
   error, sector, onSectorChange, criteria, onCriteriaChange,
+  dealName, onBackToHome,
 }: UploadZoneProps) {
   const [criteriaOpen, setCriteriaOpen] = useState(false);
 
@@ -248,9 +383,39 @@ function UploadZone({
   };
 
   return (
-    <div style={{ minHeight: "100vh", background: OFFWHITE, display: "flex", alignItems: "center", justifyContent: "center", padding: "40px 24px" }}>
+    <div style={{ minHeight: "100vh", background: OFFWHITE }}>
       <style>{GLOBAL_STYLE}</style>
 
+      {/* Nav bar — shown when inside a deal workspace */}
+      {dealName && onBackToHome && (
+        <div style={{
+          background: NAVY, color: "#fff", display: "flex", alignItems: "center",
+          padding: "0 24px", height: 52, gap: 16,
+        }}>
+          <button
+            onClick={onBackToHome}
+            style={{
+              background: "none", border: "none", color: "#9ca3af", fontSize: 13,
+              cursor: "pointer", fontFamily: "'Inter', sans-serif", padding: "4px 0",
+              display: "flex", alignItems: "center", gap: 6,
+            }}
+          >
+            ← All Deals
+          </button>
+          <div style={{ width: 1, height: 20, background: "#374151" }} />
+          <div style={{
+            background: RED, color: "#fff", fontFamily: "'Inter', sans-serif",
+            fontWeight: 800, fontSize: 12, padding: "4px 12px", borderRadius: 3, letterSpacing: "2px",
+          }}>
+            SAGARD
+          </div>
+          <span style={{ color: "#e5e7eb", fontSize: 14, fontFamily: "'Inter', sans-serif", fontWeight: 500 }}>
+            {dealName}
+          </span>
+        </div>
+      )}
+
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "40px 24px" }}>
       <div style={{ width: "100%", maxWidth: 540 }}>
         {/* Wordmark */}
         <div style={{ textAlign: "center", marginBottom: 40 }}>
@@ -389,6 +554,7 @@ function UploadZone({
         <p style={{ textAlign: "center", color: "#9ca3af", fontSize: 11, marginTop: 14 }}>
           Documents are processed in real time and not stored.
         </p>
+      </div>
       </div>
     </div>
   );
@@ -666,9 +832,9 @@ function buildICBrief(assessment: Assessment, claims: Claim[], conflicts: CrossD
     #ic-brief-print { display: block !important; }
   }
   #ic-brief-print {
-    font-family: Arial, sans-serif; max-width: 760px; margin: 0 auto; padding: 40px; color: #1a1a1a;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 760px; margin: 0 auto; padding: 40px; color: #1a1a1a;
   }
-  #ic-brief-print .hdr h1 { font-family: Georgia, serif; font-size: 20px; font-weight: 700; margin: 0 0 4px; }
+  #ic-brief-print .hdr h1 { font-size: 20px; font-weight: 800; margin: 0 0 4px; letter-spacing: -0.3px; }
   #ic-brief-print .hdr .meta { font-size: 11px; color: #666; }
   #ic-brief-print hr { border: none; border-top: 1px solid #ccc; margin: 16px 0; }
   #ic-brief-print .s { margin-bottom: 20px; }
@@ -676,7 +842,7 @@ function buildICBrief(assessment: Assessment, claims: Claim[], conflicts: CrossD
   #ic-brief-print p { font-size: 11px; line-height: 1.6; margin: 0 0 5px; }
   #ic-brief-print ol { margin: 0; padding-left: 20px; }
   #ic-brief-print li { font-size: 11px; line-height: 1.6; margin-bottom: 4px; }
-  #ic-brief-print .verdict { font-family: Georgia, serif; font-size: 18px; font-weight: 700; margin: 0 0 6px; }
+  #ic-brief-print .verdict { font-size: 18px; font-weight: 800; margin: 0 0 6px; letter-spacing: -0.3px; }
   #ic-brief-print table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 6px; }
   #ic-brief-print th { text-align: left; font-size: 10px; font-weight: 700; text-transform: uppercase; border-bottom: 1px solid #ccc; padding: 4px 8px; }
   #ic-brief-print td { padding: 5px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
@@ -1128,9 +1294,9 @@ function ChartsSection({ chartsData }: { chartsData: any }) {
 
 // ── Document state (useReducer) ──────────────────────────────
 interface DocEntry {
-  file: File;
+  file: File | null;   // null when restored from DB (no binary available)
   name: string;
-  url: string;
+  url: string;         // empty string when no PDF available
   numPages: number | null;
   extractedText: string;
   isProcessing: boolean;
@@ -1200,12 +1366,59 @@ function documentReducer(state: DocumentState, action: DocumentAction): Document
   }
 }
 
+// ── Drag Divider ──────────────────────────────────────────────
+function DragDivider({ onDrag, dark = false }: { onDrag: (dx: number) => void; dark?: boolean }) {
+  const divRef = useRef<HTMLDivElement>(null);
+  const bg = dark ? '#2d2d2d' : '#ddd9d4';
+  const bgHover = dark ? '#484848' : '#bbb5ae';
+  const dotColor = dark ? '#555' : '#9ca3af';
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    let lastX = e.clientX;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    if (divRef.current) divRef.current.style.background = bgHover;
+
+    const onMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - lastX;
+      lastX = ev.clientX;
+      onDrag(dx);
+    };
+    const onUp = () => {
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      if (divRef.current) divRef.current.style.background = bg;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
+
+  return (
+    <div
+      ref={divRef}
+      onMouseDown={handleMouseDown}
+      onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = bgHover; }}
+      onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = bg; }}
+      style={{ width: 6, flexShrink: 0, cursor: 'col-resize', background: bg, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+    >
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 3, pointerEvents: 'none' }}>
+        {[0, 1, 2].map(i => <div key={i} style={{ width: 2, height: 2, borderRadius: '50%', background: dotColor }} />)}
+      </div>
+    </div>
+  );
+}
+
 // ── FileExplorer ──────────────────────────────────────────────
-function FileExplorer({ docState, docDispatch, collapsed, onToggle }: {
+function FileExplorer({ docState, docDispatch, collapsed, onToggle, onDocumentExtracted, expandedWidth }: {
   docState: DocumentState;
   docDispatch: React.Dispatch<DocumentAction>;
   collapsed: boolean;
   onToggle: () => void;
+  onDocumentExtracted?: (filename: string, fileType: FileType, text: string) => void;
+  expandedWidth: number;
 }) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1230,11 +1443,12 @@ function FileExplorer({ docState, docDispatch, collapsed, onToggle }: {
     for (const entry of newEntries) {
       try {
         const formData = new FormData();
-        formData.append('file', entry.file);
+        formData.append('file', entry.file!);
         const { data } = await axios.post<{ text: string }>(`${BACKEND_URL}/extract`, formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
         });
         docDispatch({ type: 'SET_EXTRACTED_TEXT', payload: { name: entry.name, text: data.text } });
+        onDocumentExtracted?.(entry.name, entry.fileType, data.text);
       } catch {
         // leave extractedText empty on failure
       } finally {
@@ -1245,15 +1459,13 @@ function FileExplorer({ docState, docDispatch, collapsed, onToggle }: {
 
   return (
     <div style={{
-      width: collapsed ? 36 : 220,
+      width: collapsed ? 36 : expandedWidth,
       flexShrink: 0,
       background: '#1e1e1e',
       display: 'flex',
       flexDirection: 'column',
       height: '100%',
       overflow: 'hidden',
-      borderRight: '1px solid #2d2d2d',
-      transition: 'width 0.2s ease',
     }}>
       {collapsed ? (
         /* ── Collapsed strip ── */
@@ -1382,7 +1594,7 @@ function FileExplorer({ docState, docDispatch, collapsed, onToggle }: {
                           {doc.fileType}
                         </span>
                         <span style={{ fontSize: 10, color: '#6b7280', fontFamily: "'Inter', sans-serif" }}>
-                          {formatFileSize(doc.file.size)}
+                          {doc.file ? formatFileSize(doc.file.size) : 'saved'}
                         </span>
                         {doc.isProcessing && (
                           <span style={{ fontSize: 9, color: '#d97706', fontFamily: "'Inter', sans-serif" }}>
@@ -1421,11 +1633,521 @@ function FileExplorer({ docState, docDispatch, collapsed, onToggle }: {
   );
 }
 
+// ── New Deal Modal ────────────────────────────────────────────
+function NewDealModal({ onConfirm, onCancel }: {
+  onConfirm: (name: string, sector: string) => void;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState('');
+  const [sector, setSector] = useState('Private Equity');
+  const inputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  const handleSubmit = () => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    onConfirm(trimmed, sector);
+  };
+
+  const inputStyle: React.CSSProperties = {
+    width: '100%', padding: '9px 12px', borderRadius: 6,
+    border: '1px solid #e5e7eb', fontSize: 13, fontFamily: "'Inter', sans-serif",
+    background: '#fff', color: NAVY, outline: 'none',
+  };
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ background: '#fff', borderRadius: 10, padding: 28, width: 440, boxShadow: '0 20px 60px rgba(0,0,0,0.2)' }}>
+        <p style={{ margin: '0 0 18px', fontSize: 16, fontWeight: 700, color: NAVY, fontFamily: "'Inter', sans-serif" }}>New Deal</p>
+        <div style={{ marginBottom: 14 }}>
+          <label style={{ display: 'block', marginBottom: 5, fontSize: 10, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: "'Inter', sans-serif" }}>
+            Deal Name *
+          </label>
+          <input
+            ref={inputRef}
+            type="text"
+            placeholder="e.g. Acme Healthcare Services"
+            value={name}
+            onChange={e => setName(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') handleSubmit(); if (e.key === 'Escape') onCancel(); }}
+            style={inputStyle}
+          />
+        </div>
+        <div style={{ marginBottom: 22 }}>
+          <label style={{ display: 'block', marginBottom: 5, fontSize: 10, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: "'Inter', sans-serif" }}>
+            Strategy
+          </label>
+          <select value={sector} onChange={e => setSector(e.target.value)} style={{ ...inputStyle, appearance: 'none' }}>
+            <option>Private Equity</option>
+            <option>Private Credit</option>
+            <option>Venture Capital</option>
+            <option>Real Estate</option>
+          </select>
+        </div>
+        <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
+          <button onClick={onCancel} style={{ padding: '9px 18px', background: 'none', border: '1px solid #e5e7eb', borderRadius: 6, fontSize: 13, fontFamily: "'Inter', sans-serif", cursor: 'pointer', color: '#6b7280' }}>
+            Cancel
+          </button>
+          <button onClick={handleSubmit} disabled={!name.trim()} style={{ padding: '9px 22px', background: RED, color: '#fff', border: 'none', borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: name.trim() ? 'pointer' : 'not-allowed', opacity: name.trim() ? 1 : 0.5, fontFamily: "'Inter', sans-serif" }}>
+            Create Deal
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Home Screen ───────────────────────────────────────────────
+function HomeScreen({ deals, loading, onNewDeal, onOpenDeal, onDeleteDeal }: {
+  deals: Deal[];
+  loading: boolean;
+  onNewDeal: () => void;
+  onOpenDeal: (deal: Deal) => void;
+  onDeleteDeal: (dealId: string) => void;
+}) {
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  const sectorBadgeStyle = (sector: string): React.CSSProperties => ({
+    fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 20,
+    background: '#f5f5f5', color: '#6b7280', border: '1px solid #e5e7eb',
+    fontFamily: "'Inter', sans-serif", whiteSpace: 'nowrap',
+  });
+
+  return (
+    <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: OFFWHITE }}>
+      <style>{GLOBAL_STYLE}</style>
+
+      {/* Header */}
+      <div style={{ height: 52, background: RED, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 28px', flexShrink: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          <span style={{ color: '#fff', fontFamily: "'Inter', sans-serif", fontWeight: 800, fontSize: 15, letterSpacing: '3px' }}>SAGARD</span>
+          <span style={{ color: 'rgba(255,255,255,0.7)', fontSize: 11, fontFamily: "'Inter', sans-serif", fontWeight: 600, letterSpacing: '2px' }}>DEAL ROOM</span>
+        </div>
+        <button
+          onClick={onNewDeal}
+          style={{ background: '#fff', color: RED, border: `1px solid ${RED}`, borderRadius: 6, padding: '7px 18px', fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: "'Inter', sans-serif", letterSpacing: '0.5px' }}
+        >
+          + NEW DEAL
+        </button>
+      </div>
+
+      {/* Content */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '32px 0', maxWidth: 760, margin: '0 auto', width: '100%' }}>
+        <p style={{ margin: '0 0 20px 28px', fontSize: 11, fontWeight: 700, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '2px', fontFamily: "'Inter', sans-serif" }}>
+          {loading ? 'Loading…' : `${deals.length} deal${deals.length !== 1 ? 's' : ''}`}
+        </p>
+
+        {loading && (
+          <div style={{ padding: '0 28px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {[1, 2, 3].map(i => (
+              <div key={i} style={{ height: 76, background: '#fff', borderRadius: 8, border: '1px solid #e5e7eb', opacity: 0.5 + i * 0.15 }} />
+            ))}
+          </div>
+        )}
+
+        {!loading && deals.length === 0 && (
+          <div style={{ textAlign: 'center', padding: '72px 20px' }}>
+            <p style={{ fontSize: 18, fontWeight: 700, color: '#374151', fontFamily: "'Inter', sans-serif", margin: '0 0 8px' }}>No deals yet.</p>
+            <p style={{ fontSize: 13, color: '#9ca3af', fontFamily: "'Inter', sans-serif", margin: '0 0 24px' }}>Start by analyzing your first CIM.</p>
+            <button onClick={onNewDeal} style={{ background: RED, color: '#fff', border: 'none', borderRadius: 7, padding: '11px 28px', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: "'Inter', sans-serif" }}>
+              + Analyze your first CIM
+            </button>
+          </div>
+        )}
+
+        {!loading && deals.length > 0 && (
+          <div style={{ padding: '0 28px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {deals.map(deal => {
+              const isHovered = hoveredId === deal.id;
+              const pill = deal.verdict ? dealVerdictPill[deal.verdict] : null;
+              const statusColor: Record<string, string> = {
+                'Active': '#6b7280', 'Worth Deeper Look': '#166534', 'Passed': '#991b1b', 'Closed': '#374151',
+              };
+              return (
+                <div
+                  key={deal.id}
+                  onClick={() => onOpenDeal(deal)}
+                  onMouseEnter={() => setHoveredId(deal.id)}
+                  onMouseLeave={() => { setHoveredId(null); setConfirmDeleteId(null); }}
+                  style={{
+                    background: isHovered ? '#fef3f2' : '#fff',
+                    border: `1px solid ${isHovered ? '#fecaca' : '#e5e7eb'}`,
+                    borderRadius: 8, padding: '14px 18px',
+                    display: 'flex', alignItems: 'center', gap: 14,
+                    cursor: 'pointer', transition: 'all 0.15s',
+                    boxShadow: isHovered ? '0 2px 8px rgba(145,61,62,0.08)' : '0 1px 2px rgba(0,0,0,0.04)',
+                  }}
+                >
+                  {/* Deal name + meta */}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 14, fontWeight: 600, color: NAVY, fontFamily: "'Inter', sans-serif", overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 280 }}>
+                        {deal.name}
+                      </span>
+                      <span style={sectorBadgeStyle(deal.sector)}>{deal.sector}</span>
+                      {pill && (
+                        <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 20, background: pill.bg, color: pill.color, border: `1px solid ${pill.border}`, fontFamily: "'Inter', sans-serif" }}>
+                          {deal.verdict}
+                        </span>
+                      )}
+                    </div>
+                    <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                      <span style={{ fontSize: 11, color: statusColor[deal.status] ?? '#6b7280', fontFamily: "'Inter', sans-serif", fontWeight: 500 }}>
+                        {deal.status}
+                      </span>
+                      <span style={{ fontSize: 11, color: '#9ca3af', fontFamily: "'Inter', sans-serif" }}>
+                        Updated {formatRelativeTime(deal.updated_at)}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Actions */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }} onClick={e => e.stopPropagation()}>
+                    {confirmDeleteId === deal.id ? (
+                      <>
+                        <span style={{ fontSize: 11, color: '#6b7280', fontFamily: "'Inter', sans-serif" }}>Delete?</span>
+                        <button
+                          onClick={() => { onDeleteDeal(deal.id); setConfirmDeleteId(null); }}
+                          style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 5, padding: '4px 10px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: "'Inter', sans-serif" }}
+                        >
+                          Yes
+                        </button>
+                        <button
+                          onClick={() => setConfirmDeleteId(null)}
+                          style={{ background: '#f3f4f6', color: '#374151', border: '1px solid #e5e7eb', borderRadius: 5, padding: '4px 10px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: "'Inter', sans-serif" }}
+                        >
+                          No
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        {isHovered && (
+                          <button
+                            onClick={() => setConfirmDeleteId(deal.id)}
+                            style={{ background: 'none', border: '1px solid #e5e7eb', borderRadius: 5, padding: '4px 8px', fontSize: 11, color: '#9ca3af', cursor: 'pointer', fontFamily: "'Inter', sans-serif", transition: 'all 0.15s' }}
+                            onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = '#dc2626'; (e.currentTarget as HTMLButtonElement).style.color = '#dc2626'; }}
+                            onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = '#e5e7eb'; (e.currentTarget as HTMLButtonElement).style.color = '#9ca3af'; }}
+                          >
+                            Delete
+                          </button>
+                        )}
+                        <span style={{ color: isHovered ? RED : '#d1d5db', fontSize: 18, fontWeight: 300, transition: 'color 0.15s' }}>→</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Results ──────────────────────────────────────────────────
 type ClaimFilter = "all" | "disputed" | "unverifiable" | "verified";
-type ResultTab = "overview" | "claims" | "conflicts" | "chat";
+type ResultTab = "overview" | "claims" | "conflicts" | "chat" | "comps";
 
-function Results({ data, uploadedFiles, onReset, documentText, documentsText, chartsData }: { data: AnalysisResult; uploadedFiles: File[]; onReset: () => void; documentText: string; documentsText: Record<string, string>; chartsData: any }) {
+// ── Comps Tab ─────────────────────────────────────────────────
+function CompsTab({ compsData, loading }: { compsData: CompsData | null; loading: boolean }) {
+  if (loading) {
+    return (
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16, background: OFFWHITE, padding: 40 }}>
+        <div style={{ width: 32, height: 32, border: `3px solid #e5e7eb`, borderTop: `3px solid ${RED}`, borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
+        <p style={{ color: '#6b7280', fontSize: 13, fontFamily: 'Inter, sans-serif', margin: 0 }}>Searching for comparable transactions…</p>
+        <p style={{ color: '#9ca3af', fontSize: 11, fontFamily: 'Inter, sans-serif', margin: 0 }}>Running targeted M&A database searches</p>
+      </div>
+    );
+  }
+
+  if (!compsData) {
+    return (
+      <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: OFFWHITE }}>
+        <p style={{ color: '#9ca3af', fontSize: 13, fontFamily: 'Inter, sans-serif' }}>No comparable transaction data available.</p>
+      </div>
+    );
+  }
+
+  const { deal_profile, comps, sector_context, this_deal_positioning, valuation_context, data_quality_note } = compsData;
+  const validComps = (comps ?? []).filter(c => c.ev_ebitda !== null);
+  const impliedMultiple = this_deal_positioning?.implied_ev_ebitda;
+
+  // Build chart data — comps + "This Deal" if we have implied multiple
+  const chartData = [
+    ...validComps.map(c => ({
+      name: c.company.length > 22 ? c.company.slice(0, 20) + '…' : c.company,
+      multiple: c.ev_ebitda,
+      isThisDeal: false,
+    })),
+    ...(impliedMultiple ? [{ name: 'This Deal', multiple: impliedMultiple, isThisDeal: true }] : []),
+  ];
+
+  const sectorLow = sector_context?.typical_ev_ebitda_low ?? null;
+  const sectorHigh = sector_context?.typical_ev_ebitda_high ?? null;
+  const maxMultiple = Math.max(
+    ...(chartData.map(d => d.multiple ?? 0)),
+    sectorHigh ?? 0,
+    12
+  ) + 1;
+
+  const fmt = (v: number | null | undefined, suffix = 'x') =>
+    v == null ? 'N/A' : `${v.toFixed(1)}${suffix}`;
+  const fmtEV = (v: number | null | undefined) =>
+    v == null ? 'N/A' : v >= 1000 ? `$${(v / 1000).toFixed(1)}B` : `$${v.toFixed(0)}M`;
+
+  const vsColor = this_deal_positioning?.vs_comp_set === 'Premium' ? '#d97706'
+    : this_deal_positioning?.vs_comp_set === 'Discount' ? '#16a34a'
+    : this_deal_positioning?.vs_comp_set === 'In line' ? '#166534'
+    : '#6b7280';
+
+  return (
+    <div style={{ flex: 1, overflowY: 'auto', background: OFFWHITE }}>
+
+      {/* Deal Profile Header */}
+      <div style={{ background: '#fff', padding: '14px 16px', borderBottom: '1px solid #e5e7eb' }}>
+        <p style={{ margin: '0 0 8px', ...sectionLabel }}>SEARCH PROFILE</p>
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
+          <span style={{ fontSize: 11, fontWeight: 600, background: '#1a1a1a', color: '#fff', borderRadius: 4, padding: '2px 8px', fontFamily: 'Inter, sans-serif' }}>
+            {deal_profile?.sector}
+          </span>
+          {deal_profile?.sub_sector && (
+            <span style={{ fontSize: 11, fontWeight: 600, background: '#f5f5f5', color: '#374151', borderRadius: 4, padding: '2px 8px', border: '1px solid #e5e7eb', fontFamily: 'Inter, sans-serif' }}>
+              {deal_profile.sub_sector}
+            </span>
+          )}
+          {deal_profile?.geography && (
+            <span style={{ fontSize: 11, color: '#6b7280', background: '#f5f5f5', borderRadius: 4, padding: '2px 8px', border: '1px solid #e5e7eb', fontFamily: 'Inter, sans-serif' }}>
+              {deal_profile.geography}
+            </span>
+          )}
+        </div>
+        <p style={{ margin: '0 0 6px', fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: 'Inter, sans-serif' }}>
+          {deal_profile?.description}
+        </p>
+        <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
+          {deal_profile?.revenue_millions && (
+            <span style={{ fontSize: 11, color: '#6b7280', fontFamily: 'Inter, sans-serif' }}>
+              Revenue: <strong style={{ color: '#1a1a1a' }}>${deal_profile.revenue_millions}M</strong>
+            </span>
+          )}
+          {deal_profile?.ebitda_millions && (
+            <span style={{ fontSize: 11, color: '#6b7280', fontFamily: 'Inter, sans-serif' }}>
+              EBITDA: <strong style={{ color: '#1a1a1a' }}>${deal_profile.ebitda_millions}M</strong>
+            </span>
+          )}
+          {deal_profile?.ebitda_margin_pct && (
+            <span style={{ fontSize: 11, color: '#6b7280', fontFamily: 'Inter, sans-serif' }}>
+              Margin: <strong style={{ color: '#1a1a1a' }}>{deal_profile.ebitda_margin_pct}%</strong>
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Comps Table */}
+      <div style={{ background: '#fff', margin: '6px 0', padding: '14px 16px', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
+        <p style={{ margin: '0 0 10px', ...sectionLabel }}>COMPARABLE TRANSACTIONS ({comps?.length ?? 0})</p>
+        {(comps?.length ?? 0) === 0 ? (
+          <p style={{ fontSize: 12, color: '#9ca3af', fontFamily: 'Inter, sans-serif' }}>No confirmed comparable transactions found in public sources.</p>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11, fontFamily: 'Inter, sans-serif' }}>
+              <thead>
+                <tr style={{ background: '#f8f6f3', borderBottom: '2px solid #e5e7eb' }}>
+                  {['Company', 'Acquirer', 'Date', 'EV', 'EV/EBITDA', 'EV/Rev', 'Notes'].map(h => (
+                    <th key={h} style={{ padding: '7px 10px', textAlign: h === 'EV' || h === 'EV/EBITDA' || h === 'EV/Rev' ? 'right' : 'left', fontSize: 9, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.5px', whiteSpace: 'nowrap' }}>
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {comps.map((comp, i) => {
+                  const multipleColor = comp.ev_ebitda == null ? '#9ca3af'
+                    : sectorLow && comp.ev_ebitda < sectorLow ? '#16a34a'
+                    : sectorHigh && comp.ev_ebitda > sectorHigh ? '#dc2626'
+                    : '#1a1a1a';
+                  return (
+                    <tr key={i} style={{ borderBottom: '1px solid #f0ede8', background: i % 2 === 0 ? '#fff' : '#fafafa' }}>
+                      <td style={{ padding: '8px 10px', fontWeight: 600, color: '#1a1a1a' }}>
+                        {comp.source_url ? (
+                          <a href={comp.source_url} target="_blank" rel="noreferrer" style={{ color: '#1a1a1a', textDecoration: 'none' }}>
+                            {comp.company} <span style={{ color: RED, fontSize: 9 }}>↗</span>
+                          </a>
+                        ) : comp.company}
+                      </td>
+                      <td style={{ padding: '8px 10px', color: '#374151' }}>{comp.acquirer}</td>
+                      <td style={{ padding: '8px 10px', color: '#6b7280', whiteSpace: 'nowrap' }}>{comp.date}</td>
+                      <td style={{ padding: '8px 10px', textAlign: 'right', color: '#374151', whiteSpace: 'nowrap' }}>{fmtEV(comp.ev_millions)}</td>
+                      <td style={{ padding: '8px 10px', textAlign: 'right', fontWeight: 700, color: multipleColor, whiteSpace: 'nowrap' }}>{fmt(comp.ev_ebitda)}</td>
+                      <td style={{ padding: '8px 10px', textAlign: 'right', color: '#374151', whiteSpace: 'nowrap' }}>{fmt(comp.ev_revenue)}</td>
+                      <td style={{ padding: '8px 10px', color: '#6b7280', maxWidth: 140 }}>
+                        <div title={comp.why_comparable} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {comp.why_comparable}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {/* Sector range row */}
+                {sectorLow && sectorHigh && (
+                  <tr style={{ borderTop: '2px solid #e5e7eb', background: '#f8f6f3' }}>
+                    <td colSpan={4} style={{ padding: '7px 10px', fontSize: 10, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                      Sector Range
+                    </td>
+                    <td style={{ padding: '7px 10px', textAlign: 'right', fontWeight: 700, color: '#374151', fontSize: 11 }}>
+                      {sectorLow.toFixed(1)}x – {sectorHigh.toFixed(1)}x
+                    </td>
+                    <td colSpan={2} />
+                  </tr>
+                )}
+                {/* This Deal row */}
+                {impliedMultiple && (
+                  <tr style={{ background: '#fef3f2', borderTop: '1px solid #fecaca' }}>
+                    <td colSpan={4} style={{ padding: '7px 10px', fontSize: 10, fontWeight: 700, color: RED, textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                      This Deal (Implied)
+                    </td>
+                    <td style={{ padding: '7px 10px', textAlign: 'right', fontWeight: 700, color: RED, fontSize: 11 }}>
+                      {impliedMultiple.toFixed(1)}x
+                    </td>
+                    <td style={{ padding: '7px 10px', textAlign: 'right', fontWeight: 700, color: RED, fontSize: 11 }}>
+                      {fmt(this_deal_positioning?.implied_ev_revenue)}
+                    </td>
+                    <td style={{ padding: '7px 10px', fontSize: 10, color: RED, fontStyle: 'italic' }}>
+                      {this_deal_positioning?.vs_comp_set}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* Multiple Range Chart */}
+      {chartData.length > 0 && (
+        <div style={{ background: '#fff', margin: '6px 0', padding: '14px 16px', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
+          <p style={{ margin: '0 0 4px', ...sectionLabel }}>EV/EBITDA MULTIPLE RANGE</p>
+          <p style={{ margin: '0 0 12px', fontSize: 11, color: '#9ca3af', fontFamily: 'Inter, sans-serif' }}>
+            Comparable transactions vs. this deal
+          </p>
+          <ResponsiveContainer width="100%" height={chartData.length * 36 + 50}>
+            <BarChart layout="vertical" data={chartData} margin={{ top: 5, right: 40, left: 0, bottom: 5 }}>
+              <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f0ede8" />
+              <XAxis
+                type="number"
+                domain={[0, maxMultiple]}
+                tick={{ fontSize: 10 }}
+                tickFormatter={(v) => `${v}x`}
+              />
+              <YAxis
+                type="category"
+                dataKey="name"
+                width={130}
+                tick={{ fontSize: 10, fontFamily: 'Inter, sans-serif' }}
+              />
+              <Tooltip
+                formatter={(v: any) => [`${(v as number).toFixed(1)}x EV/EBITDA`, '']}
+                contentStyle={{ fontFamily: 'Inter, sans-serif', fontSize: 11 }}
+              />
+              <Bar dataKey="multiple" radius={[0, 3, 3, 0]}>
+                {chartData.map((entry, i) => (
+                  <Cell key={i} fill={entry.isThisDeal ? RED : entry.multiple && sectorHigh && entry.multiple > sectorHigh ? '#d97706' : NAVY} />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+          {sectorLow && sectorHigh && (
+            <p style={{ margin: '4px 0 0', fontSize: 10, color: '#9ca3af', fontFamily: 'Inter, sans-serif', textAlign: 'center' }}>
+              Sector range: {sectorLow.toFixed(1)}x – {sectorHigh.toFixed(1)}x EV/EBITDA
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Deal Positioning */}
+      {this_deal_positioning?.vs_comp_set && this_deal_positioning.vs_comp_set !== 'Cannot determine' && (
+        <div style={{ background: '#fff', margin: '6px 0', padding: '14px 16px', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+            <p style={{ margin: 0, ...sectionLabel }}>DEAL POSITIONING</p>
+            <span style={{ fontSize: 11, fontWeight: 700, color: vsColor, background: vsColor + '15', border: `1px solid ${vsColor}40`, borderRadius: 4, padding: '2px 8px', fontFamily: 'Inter, sans-serif' }}>
+              {this_deal_positioning.vs_comp_set.toUpperCase()}
+            </span>
+          </div>
+          <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.6, fontFamily: 'Inter, sans-serif' }}>
+            {this_deal_positioning.rationale}
+          </p>
+        </div>
+      )}
+
+      {/* Sector Context */}
+      {sector_context && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, padding: '6px', margin: '0 0 6px' }}>
+          <div style={{ background: '#fff', padding: '12px', borderRadius: 6, border: '1px solid #e5e7eb' }}>
+            <p style={{ margin: '0 0 8px', ...sectionLabel, color: '#16a34a' }}>PREMIUM DRIVERS</p>
+            {(sector_context.multiple_drivers ?? []).map((d, i) => (
+              <div key={i} style={{ borderLeft: '2px solid #16a34a', paddingLeft: 8, marginBottom: 6 }}>
+                <p style={{ margin: 0, fontSize: 11, color: '#374151', lineHeight: 1.4, fontFamily: 'Inter, sans-serif' }}>{d}</p>
+              </div>
+            ))}
+          </div>
+          <div style={{ background: '#fff', padding: '12px', borderRadius: 6, border: '1px solid #e5e7eb' }}>
+            <p style={{ margin: '0 0 8px', ...sectionLabel, color: '#dc2626' }}>DISCOUNT DRIVERS</p>
+            {(sector_context.discount_drivers ?? []).map((d, i) => (
+              <div key={i} style={{ borderLeft: '2px solid #dc2626', paddingLeft: 8, marginBottom: 6 }}>
+                <p style={{ margin: 0, fontSize: 11, color: '#374151', lineHeight: 1.4, fontFamily: 'Inter, sans-serif' }}>{d}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Valuation Context */}
+      {valuation_context && (
+        <div style={{ background: '#fff', margin: '0 0 6px', padding: '14px 16px', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
+          <p style={{ margin: '0 0 10px', ...sectionLabel }}>VALUATION CONTEXT</p>
+          {valuation_context.split('\n\n').filter(Boolean).map((para, i) => (
+            <p key={i} style={{ margin: '0 0 10px', fontSize: 12, color: '#374151', lineHeight: 1.7, fontFamily: 'Inter, sans-serif' }}>{para}</p>
+          ))}
+        </div>
+      )}
+
+      {/* Data Quality Notice */}
+      <div style={{ margin: '0 0 16px', padding: '10px 16px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 6, marginLeft: 16, marginRight: 16 }}>
+        <p style={{ margin: 0, fontSize: 11, color: '#92400e', fontFamily: 'Inter, sans-serif', lineHeight: 1.5 }}>
+          <strong>Data Quality:</strong> {data_quality_note ?? 'Comps are sourced from public web data and may be incomplete. Verify with PitchBook or CapIQ before use in any IC memo.'}
+        </p>
+      </div>
+
+    </div>
+  );
+}
+
+function Results({
+  data, uploadedFiles, onReset, documentText, documentsText, chartsData,
+  compsData, compsLoading, savedDocEntries, initialChatMessages,
+  dealName, dealStatus, onStatusChange, onSaveChatMessage, saveError, onBackToHome,
+  onDocumentExtracted,
+}: {
+  data: AnalysisResult;
+  uploadedFiles: File[];
+  onReset: () => void;
+  documentText: string;
+  documentsText: Record<string, string>;
+  chartsData: any;
+  compsData: CompsData | null;
+  compsLoading: boolean;
+  savedDocEntries?: DocEntry[];
+  initialChatMessages?: ChatMessage[];
+  dealName: string;
+  dealStatus: string;
+  onStatusChange: (s: string) => void;
+  onSaveChatMessage: (msg: ChatMessage) => void;
+  saveError: boolean;
+  onBackToHome: () => void;
+  onDocumentExtracted?: (filename: string, fileType: FileType, text: string) => void;
+}) {
   const { assessment, claims, cross_document_conflicts } = data;
   const [activeClaim, setActiveClaim] = useState<number | null>(null);
   const [claimFilter, setClaimFilter] = useState<ClaimFilter>("all");
@@ -1436,10 +2158,58 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
   const [activeTab, setActiveTab] = useState<ResultTab>("overview");
   const dealScore: number = chartsData?.deal_scorecard?.overall_score ?? 0;
   const dealScoreColor = dealScore < 5 ? '#dc2626' : dealScore <= 7 ? '#d97706' : '#16a34a';
-  const companyName = uploadedFiles[0]?.name.replace(/\.[^.]+$/, '') ?? 'Analysis';
+  const companyName = dealName || uploadedFiles[0]?.name.replace(/\.[^.]+$/, '') || 'Analysis';
 
   // File explorer collapse state
   const [explorerCollapsed, setExplorerCollapsed] = useState(false);
+
+  // ── Resize state ──────────────────────────────────────────────
+  const mainContainerRef = useRef<HTMLDivElement>(null);
+
+  const [rightPanelWidth, setRightPanelWidth] = useState<number>(() => {
+    try {
+      const n = Number(localStorage.getItem('cim-right-panel-width'));
+      return n >= 380 && n <= 1400 ? n : 480;
+    } catch { return 480; }
+  });
+  const [explorerWidth, setExplorerWidth] = useState<number>(() => {
+    try {
+      const n = Number(localStorage.getItem('cim-explorer-width'));
+      return n >= 140 && n <= 400 ? n : 220;
+    } catch { return 220; }
+  });
+
+  useEffect(() => { try { localStorage.setItem('cim-right-panel-width', String(rightPanelWidth)); } catch {} }, [rightPanelWidth]);
+  useEffect(() => { try { localStorage.setItem('cim-explorer-width', String(explorerWidth)); } catch {} }, [explorerWidth]);
+
+  // Clamp panels when window is resized
+  useEffect(() => {
+    const clamp = () => {
+      const total = mainContainerRef.current?.offsetWidth ?? window.innerWidth;
+      setRightPanelWidth(w => Math.max(380, Math.min(w, total - 300)));
+      setExplorerWidth(w => Math.max(140, Math.min(w, 360)));
+    };
+    window.addEventListener('resize', clamp);
+    return () => window.removeEventListener('resize', clamp);
+  }, []);
+
+  // Stable refs so drag callbacks don't go stale
+  const explorerWidthRef = useRef(explorerWidth);
+  useEffect(() => { explorerWidthRef.current = explorerWidth; }, [explorerWidth]);
+  const explorerCollapsedRef = useRef(explorerCollapsed);
+  useEffect(() => { explorerCollapsedRef.current = explorerCollapsed; }, [explorerCollapsed]);
+
+  const handleMainDividerDrag = useCallback((dx: number) => {
+    setRightPanelWidth(prev => {
+      const total = mainContainerRef.current?.offsetWidth ?? window.innerWidth;
+      const explorerW = explorerCollapsedRef.current ? 36 : explorerWidthRef.current;
+      return Math.max(380, Math.min(prev - dx, total - explorerW - 300));
+    });
+  }, []);
+
+  const handleExplorerDividerDrag = useCallback((dx: number) => {
+    setExplorerWidth(prev => Math.max(140, Math.min(prev + dx, 360)));
+  }, []);
 
   // Document state via useReducer — single source of truth, eliminates stale closure issues
   const [docState, docDispatch] = useReducer(documentReducer, {
@@ -1468,18 +2238,22 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
   const navigateToRef = useRef(navigateTo);
   useEffect(() => { navigateToRef.current = navigateTo; }, [navigateTo]);
 
-  // Create object URLs when uploaded files change; revoke on cleanup
+  // Create object URLs when uploaded files change; revoke on cleanup.
+  // Falls back to savedDocEntries when there are no live files (loaded from DB).
   useEffect(() => {
-    if (uploadedFiles.length === 0) return;
-    const docs: DocEntry[] = uploadedFiles.map(f => ({
-      file: f, name: f.name, url: URL.createObjectURL(f), numPages: null,
-      extractedText: documentsText[f.name] ?? '',
-      isProcessing: false,
-      fileType: getFileType(f.name),
-    }));
-    docDispatch({ type: 'LOAD_DOCUMENTS', payload: docs });
-    return () => { docs.forEach(d => URL.revokeObjectURL(d.url)); };
-  }, [uploadedFiles]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (uploadedFiles.length > 0) {
+      const docs: DocEntry[] = uploadedFiles.map(f => ({
+        file: f, name: f.name, url: URL.createObjectURL(f), numPages: null,
+        extractedText: documentsText[f.name] ?? '',
+        isProcessing: false,
+        fileType: getFileType(f.name),
+      }));
+      docDispatch({ type: 'LOAD_DOCUMENTS', payload: docs });
+      return () => { docs.forEach(d => URL.revokeObjectURL(d.url)); };
+    } else if (savedDocEntries && savedDocEntries.length > 0) {
+      docDispatch({ type: 'LOAD_DOCUMENTS', payload: savedDocEntries });
+    }
+  }, [uploadedFiles, savedDocEntries]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Expose window.jumpToPage — registered once, reads only docStateRef (always current)
   useEffect(() => {
@@ -1540,8 +2314,8 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
     return () => { delete (window as any).jumpToPage; };
   }, []); // empty deps — reads docStateRef (always current) and docDispatch (stable)
 
-  // Chat state
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  // Chat state — seeded from DB when loading a saved deal
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(initialChatMessages ?? []);
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -1556,7 +2330,9 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
     const userMsg = chatInput.trim();
     const historySnapshot = [...chatMessages];
     const ts = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    setChatMessages(prev => [...prev, { role: 'user', content: userMsg, timestamp: ts }]);
+    const userMsgObj: ChatMessage = { role: 'user', content: userMsg, timestamp: ts };
+    setChatMessages(prev => [...prev, userMsgObj]);
+    onSaveChatMessage(userMsgObj);
     setChatInput('');
     setChatLoading(true);
     try {
@@ -1579,6 +2355,7 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       };
       setChatMessages(prev => [...prev, assistantMsg]);
+      onSaveChatMessage(assistantMsg);
     } catch {
       setChatMessages(prev => [...prev, { role: 'assistant', content: 'Sorry, something went wrong. Please try again.', timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
     } finally {
@@ -1618,18 +2395,44 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
       <style>{GLOBAL_STYLE}</style>
 
       {/* Nav bar */}
-      <div style={{ height: 48, background: RED, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 20px", flexShrink: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+      <div style={{ height: 48, background: RED, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 16px", flexShrink: 0 }}>
+        {/* Left: back button + wordmark */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button
+            onClick={onBackToHome}
+            style={{ background: 'rgba(255,255,255,0.15)', border: '1px solid rgba(255,255,255,0.25)', color: '#fff', borderRadius: 5, padding: '4px 11px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: "'Inter', sans-serif", whiteSpace: 'nowrap' }}
+          >
+            ← All Deals
+          </button>
           <span style={{ color: "#fff", fontFamily: "'Inter', sans-serif", fontWeight: 800, fontSize: 15, letterSpacing: "3px" }}>SAGARD</span>
-          <span style={{ color: "rgba(255,255,255,0.7)", fontSize: 12, fontFamily: "'Inter', sans-serif", fontWeight: 400 }}>CIM Analyzer</span>
+          {dealName && (
+            <span style={{ color: "rgba(255,255,255,0.85)", fontSize: 12, fontFamily: "'Inter', sans-serif", fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 260 }}>
+              {dealName}
+            </span>
+          )}
         </div>
-        <span style={{ color: "rgba(255,255,255,0.4)", fontSize: 11, fontFamily: "'Inter', sans-serif" }}>
-          Analyzed in ~60s · Est. manual review: 2–3 hrs
-        </span>
+        {/* Right: save error + status dropdown */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {saveError && (
+            <span style={{ fontSize: 11, color: 'rgba(255,255,200,0.9)', fontFamily: "'Inter', sans-serif", animation: 'pulse 1s ease-in-out' }}>
+              ⚠ Not saved
+            </span>
+          )}
+          <select
+            value={dealStatus}
+            onChange={e => onStatusChange(e.target.value)}
+            style={{ background: 'rgba(255,255,255,0.15)', border: '1px solid rgba(255,255,255,0.25)', color: '#fff', borderRadius: 5, padding: '4px 8px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: "'Inter', sans-serif", outline: 'none' }}
+          >
+            <option style={{ background: '#913d3e', color: '#fff' }}>Active</option>
+            <option style={{ background: '#913d3e', color: '#fff' }}>Worth Deeper Look</option>
+            <option style={{ background: '#913d3e', color: '#fff' }}>Passed</option>
+            <option style={{ background: '#913d3e', color: '#fff' }}>Closed</option>
+          </select>
+        </div>
       </div>
 
       {/* Main split */}
-      <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+      <div ref={mainContainerRef} style={{ flex: 1, display: "flex", overflow: "hidden" }}>
 
         {/* File Explorer */}
         <FileExplorer
@@ -1637,10 +2440,15 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
           docDispatch={docDispatch}
           collapsed={explorerCollapsed}
           onToggle={() => setExplorerCollapsed(c => !c)}
+          onDocumentExtracted={onDocumentExtracted}
+          expandedWidth={explorerWidth}
         />
 
+        {/* Drag divider: Explorer | PDF */}
+        <DragDivider onDrag={handleExplorerDividerDrag} dark={true} />
+
         {/* Center: PDF */}
-        <div id="pdf-viewer-panel" style={{ flex: 1, minWidth: 0, borderRight: '1px solid #e5e7eb', display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', transition: 'all 0.2s ease' }}>
+        <div id="pdf-viewer-panel" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
           <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: '#ffffff', borderBottom: '1px solid #e5e7eb', fontSize: 11, fontFamily: 'Inter, sans-serif', color: '#6b7280' }}>
             <button onClick={() => navigateTo(docState.currentPage - 1)} disabled={docState.currentPage <= 1}
               style={{ background: 'none', border: 'none', cursor: docState.currentPage <= 1 ? 'default' : 'pointer', color: RED, fontWeight: 600, fontSize: 13, padding: '0 4px', opacity: docState.currentPage <= 1 ? 0.3 : 1 }}>←</button>
@@ -1650,7 +2458,7 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
               style={{ background: 'none', border: 'none', cursor: (docState.documents[docState.activeIndex]?.numPages && docState.currentPage >= (docState.documents[docState.activeIndex].numPages ?? Infinity)) ? 'default' : 'pointer', color: RED, fontWeight: 600, fontSize: 13, padding: '0 4px', opacity: (docState.documents[docState.activeIndex]?.numPages && docState.currentPage >= (docState.documents[docState.activeIndex].numPages ?? Infinity)) ? 0.3 : 1 }}>→</button>
           </div>
           <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-            {docState.documents[docState.activeIndex]?.url && (
+            {docState.documents[docState.activeIndex]?.url ? (
               <PDFViewer
                 file={docState.documents[docState.activeIndex].url}
                 claims={claims}
@@ -1666,12 +2474,25 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
                   }
                 }}
               />
-            )}
+            ) : docState.documents.length > 0 ? (
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#3c3f41', gap: 10 }}>
+                <span style={{ fontSize: 28, opacity: 0.4 }}>📄</span>
+                <p style={{ color: '#9ca3af', fontSize: 13, fontFamily: 'Inter, sans-serif', margin: 0, textAlign: 'center', lineHeight: 1.5 }}>
+                  PDF not available
+                </p>
+                <p style={{ color: '#6b7280', fontSize: 11, fontFamily: 'Inter, sans-serif', margin: 0, textAlign: 'center' }}>
+                  Re-upload this document to view it.<br />Text content is still available for chat.
+                </p>
+              </div>
+            ) : null}
           </div>
         </div>
 
+        {/* Drag divider: PDF | Analysis */}
+        <DragDivider onDrag={handleMainDividerDrag} dark={false} />
+
         {/* Right: Analysis — tabbed dashboard */}
-        <div style={{ width: 480, flexShrink: 0, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', borderLeft: '1px solid #e5e7eb' }}>
+        <div style={{ width: rightPanelWidth, flexShrink: 0, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
 
           {/* Panel header — company name + verdict pill + actions */}
           <div style={{ height: 48, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 16px', background: '#fff', borderBottom: '1px solid #e5e7eb', flexShrink: 0 }}>
@@ -1694,17 +2515,28 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
 
           {/* Tab bar */}
           <div style={{ background: '#f8f6f3', borderBottom: '1px solid #e5e7eb', padding: '0 16px', height: 40, display: 'flex', alignItems: 'flex-end', flexShrink: 0 }}>
-            {(['overview', 'claims', 'conflicts', 'chat'] as ResultTab[]).map(tab => (
-              <button key={tab} onClick={() => setActiveTab(tab)} style={{
-                padding: '0 16px 10px 16px', fontFamily: 'Inter, sans-serif', fontSize: 11, fontWeight: 600,
-                letterSpacing: '1px', textTransform: 'uppercase', cursor: 'pointer',
-                color: activeTab === tab ? RED : '#6b7280',
-                border: 'none', borderBottom: activeTab === tab ? `2px solid ${RED}` : '2px solid transparent',
-                background: 'transparent',
-              }}>
-                {tab === 'conflicts' ? `CONFLICTS${conflicts.length > 0 ? ` (${conflicts.length})` : ''}` : tab.toUpperCase()}
-              </button>
-            ))}
+            {(['overview', 'claims', 'conflicts', 'chat', 'comps'] as ResultTab[]).map(tab => {
+              let label: string;
+              if (tab === 'conflicts') label = `CONFLICTS${conflicts.length > 0 ? ` (${conflicts.length})` : ''}`;
+              else if (tab === 'comps') {
+                if (compsLoading) label = 'COMPS…';
+                else if (compsData) label = `COMPS (${compsData.comps?.length ?? 0})`;
+                else label = 'COMPS';
+              } else {
+                label = tab.toUpperCase();
+              }
+              return (
+                <button key={tab} onClick={() => setActiveTab(tab)} style={{
+                  padding: '0 13px 10px 13px', fontFamily: 'Inter, sans-serif', fontSize: 11, fontWeight: 600,
+                  letterSpacing: '1px', textTransform: 'uppercase', cursor: 'pointer',
+                  color: activeTab === tab ? RED : '#6b7280',
+                  border: 'none', borderBottom: activeTab === tab ? `2px solid ${RED}` : '2px solid transparent',
+                  background: 'transparent',
+                }}>
+                  {label}
+                </button>
+              );
+            })}
           </div>
 
           {/* Tab content area */}
@@ -1890,6 +2722,13 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
               </div>
             )}
 
+            {/* ── COMPS TAB ── */}
+            {activeTab === 'comps' && (
+              <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+                <CompsTab compsData={compsData} loading={compsLoading} />
+              </div>
+            )}
+
             {/* ── CHAT TAB ── */}
             {activeTab === 'chat' && (
               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#fff' }}>
@@ -1996,6 +2835,23 @@ function Results({ data, uploadedFiles, onReset, documentText, documentsText, ch
 
 // ── App ──────────────────────────────────────────────────────
 export default function App() {
+  // Persistence
+  const {
+    loadDeals, loadDeal, createDeal, saveDeal,
+    saveDocument, saveAnalysis, saveChatMessage, deleteDeal, saveError,
+  } = useDealPersistence();
+
+  // ── View routing ─────────────────────────────────────────────
+  const [appView, setAppView]           = useState<AppView>('home');
+  const [deals, setDeals]               = useState<Deal[]>([]);
+  const [dealsLoading, setDealsLoading] = useState(true);
+  const [activeDealId, setActiveDealId] = useState<string | null>(null);
+  const [activeDealName, setActiveDealName]     = useState('');
+  const [activeDealStatus, setActiveDealStatus] = useState('Active');
+  const [showNewDealModal, setShowNewDealModal] = useState(false);
+  const [dealWorkspaceLoading, setDealWorkspaceLoading] = useState(false);
+
+  // ── Analysis state ───────────────────────────────────────────
   const [loading, setLoading]             = useState(false);
   const [loadingStep, setLoadingStep]     = useState(0);
   const [results, setResults]             = useState<AnalysisResult | null>(null);
@@ -2007,7 +2863,183 @@ export default function App() {
   const [documentText, setDocumentText]   = useState('');
   const [documentsText, setDocumentsText] = useState<Record<string, string>>({});
   const [chartsData, setChartsData]       = useState<any>(null);
+  const [compsData, setCompsData]         = useState<CompsData | null>(null);
+  const [compsLoading, setCompsLoading]   = useState(false);
+  // Restored from DB (no File objects)
+  const [savedDocEntries, setSavedDocEntries]         = useState<DocEntry[]>([]);
+  const [initialChatMessages, setInitialChatMessages] = useState<ChatMessage[]>([]);
 
+  // Refs to latest state for use inside async callbacks
+  const resultsRef   = useRef<AnalysisResult | null>(null);
+  const chartsDataRef = useRef<any>(null);
+  useEffect(() => { resultsRef.current    = results;    }, [results]);
+  useEffect(() => { chartsDataRef.current = chartsData; }, [chartsData]);
+
+  // Cache uploaded File objects by deal ID so PDFs survive back-navigation within the session
+  const dealFilesCache = useRef<Map<string, File[]>>(new Map());
+
+  // ── Load deals on mount ──────────────────────────────────────
+  useEffect(() => {
+    loadDeals().then(d => { setDeals(d); setDealsLoading(false); });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Reset all deal-level state ───────────────────────────────
+  const resetDealState = useCallback(() => {
+    setResults(null);
+    setStagedFiles([]);
+    setUploadedFiles([]);
+    setError(null);
+    setDocumentText('');
+    setDocumentsText({});
+    setChartsData(null);
+    setCompsData(null);
+    setCompsLoading(false);
+    setSavedDocEntries([]);
+    setInitialChatMessages([]);
+  }, []);
+
+  // ── Home screen actions ──────────────────────────────────────
+  const handleNewDeal = () => setShowNewDealModal(true);
+
+  const handleCreateDeal = async (name: string, dealSector: string) => {
+    setShowNewDealModal(false);
+    console.log('[Deal] Creating deal:', { name, dealSector, supabaseConfigured: isSupabaseConfigured });
+    const deal = await createDeal(name, dealSector);
+    if (deal) {
+      console.log('[Deal] Saved to DB:', deal.id);
+      setDeals(prev => [deal, ...prev]);
+      setActiveDealId(deal.id);
+    } else {
+      // No Supabase — create a local-only deal so it shows on the home screen
+      const localDeal: Deal = {
+        id: `local_${Date.now()}`,
+        name,
+        sector: dealSector,
+        status: 'Active',
+        verdict: null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      console.log('[Deal] No DB — using local deal:', localDeal.id);
+      setDeals(prev => [localDeal, ...prev]);
+      setActiveDealId(localDeal.id);
+    }
+    setActiveDealName(name);
+    setActiveDealStatus('Active');
+    setSector(dealSector);
+    resetDealState();
+    setAppView('deal');
+  };
+
+  const handleOpenDeal = async (deal: Deal) => {
+    setDealWorkspaceLoading(true);
+    setActiveDealId(deal.id);
+    setActiveDealName(deal.name);
+    setActiveDealStatus(deal.status);
+    setSector(deal.sector);
+    resetDealState();
+
+    const loaded: LoadedDealData | null = await loadDeal(deal.id);
+    if (loaded) {
+      if (loaded.analysis) {
+        const restored: AnalysisResult = {
+          assessment: loaded.analysis.assessment,
+          claims: loaded.analysis.claims ?? [],
+          cross_document_conflicts: loaded.analysis.conflicts ?? [],
+          charts_data: loaded.analysis.charts_data,
+        };
+        setResults(restored);
+        setChartsData(loaded.analysis.charts_data ?? null);
+        setCompsData(loaded.analysis.comps_data ?? null);
+        // Rebuild documentText from saved docs for chat
+        const docTexts: Record<string, string> = {};
+        loaded.documents.forEach(d => { docTexts[d.filename] = d.extracted_text; });
+        setDocumentsText(docTexts);
+        setDocumentText(Object.values(docTexts).join('\n\n'));
+      }
+      if (loaded.documents.length > 0) {
+        const memoryCached = dealFilesCache.current.get(deal.id) ?? [];
+        const cachedFiles = memoryCached.length > 0 ? memoryCached : (await loadFilesFromIDB(deal.id) ?? []);
+        if (cachedFiles.length > 0) {
+          // Restore files into memory cache and uploadedFiles — Results useEffect
+          // will create object URLs and show the real PDF viewer
+          dealFilesCache.current.set(deal.id, cachedFiles);
+          setUploadedFiles(cachedFiles);
+        } else {
+          // No cached files anywhere — fall back to text-only entries (PDF not available)
+          setSavedDocEntries(loaded.documents.map(d => ({
+            file: null,
+            name: d.filename,
+            url: '',
+            numPages: null,
+            extractedText: d.extracted_text,
+            isProcessing: false,
+            fileType: getFileType(d.filename),
+          })));
+        }
+      }
+      if (loaded.chatMessages.length > 0) {
+        const msgs: ChatMessage[] = loaded.chatMessages.map(m => ({
+          role: m.role,
+          content: m.content,
+          segments: m.segments ? m.segments as Segment[] : undefined,
+          timestamp: m.timestamp,
+        }));
+        setInitialChatMessages(msgs);
+      }
+    }
+    setDealWorkspaceLoading(false);
+    setAppView('deal');
+  };
+
+  const handleBackToHome = useCallback(() => {
+    // Cache current files so PDFs are still viewable if the user re-opens this deal
+    if (activeDealId && uploadedFiles.length > 0) {
+      dealFilesCache.current.set(activeDealId, uploadedFiles);
+    }
+    resetDealState();
+    setActiveDealId(null);
+    setActiveDealName('');
+    // Only refresh from DB if Supabase is configured — otherwise loadDeals() returns []
+    // and would wipe locally-tracked deals from state
+    if (isSupabaseConfigured) {
+      console.log('[Deal] Refreshing deals list from DB');
+      loadDeals().then(d => {
+        console.log('[Deal] Loaded', d.length, 'deals from DB');
+        setDeals(d);
+      });
+    }
+    setAppView('home');
+  }, [resetDealState, loadDeals, activeDealId, uploadedFiles]);
+
+  // ── Delete deal ──────────────────────────────────────────────
+  const handleDeleteDeal = useCallback(async (dealId: string) => {
+    setDeals(prev => prev.filter(d => d.id !== dealId));
+    dealFilesCache.current.delete(dealId);
+    deleteFilesFromIDB(dealId);
+    await deleteDeal(dealId);
+  }, [deleteDeal]);
+
+  // ── Status change ────────────────────────────────────────────
+  const handleStatusChange = useCallback(async (status: string) => {
+    setActiveDealStatus(status);
+    if (activeDealId) {
+      await saveDeal(activeDealId, { status } as any);
+      setDeals(prev => prev.map(d => d.id === activeDealId ? { ...d, status, updated_at: new Date().toISOString() } : d));
+    }
+  }, [activeDealId, saveDeal]);
+
+  // ── Chat message persistence ─────────────────────────────────
+  const handleSaveChatMessage = useCallback(async (msg: ChatMessage) => {
+    if (activeDealId) await saveChatMessage(activeDealId, msg);
+  }, [activeDealId, saveChatMessage]);
+
+  // ── Document extraction (from FileExplorer post-analysis adds) ──
+  const handleDocumentExtracted = useCallback(async (filename: string, fileType: FileType, text: string) => {
+    if (activeDealId) await saveDocument(activeDealId, filename, fileType, text);
+  }, [activeDealId, saveDocument]);
+
+  // ── File staging ─────────────────────────────────────────────
   const handleAddFiles = useCallback((incoming: File[]) => {
     setStagedFiles(prev => {
       const existing = new Set(prev.map(f => f.name));
@@ -2019,9 +3051,40 @@ export default function App() {
     setStagedFiles(prev => prev.filter((_, j) => j !== i));
   }, []);
 
+  // ── Comps fetch ───────────────────────────────────────────────
+  const fetchComps = useCallback(async (assessment: Assessment, docTextPreview: string, activeSector: string) => {
+    setCompsLoading(true);
+    setCompsData(null);
+    try {
+      const fd = new FormData();
+      fd.append("assessment_json", JSON.stringify(assessment));
+      fd.append("document_text_preview", docTextPreview.slice(0, 8000));
+      fd.append("sector", activeSector);
+      const { data } = await axios.post<CompsData>(`${BACKEND_URL}/comps`, fd, {
+        headers: { "Content-Type": "multipart/form-data" }, timeout: 180000,
+      });
+      setCompsData(data);
+      // Persist comps into the analysis record
+      if (activeDealId) {
+        const r = resultsRef.current;
+        await saveAnalysis(
+          activeDealId,
+          r?.assessment, r?.claims, r?.cross_document_conflicts,
+          chartsDataRef.current, data,
+        );
+      }
+    } catch (err) {
+      console.error("Comps fetch failed:", err);
+    } finally {
+      setCompsLoading(false);
+    }
+  }, [activeDealId, saveAnalysis]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Main analysis ─────────────────────────────────────────────
   const handleAnalyze = async () => {
     if (!stagedFiles.length) return;
     setLoading(true); setError(null); setResults(null);
+    setCompsData(null); setCompsLoading(false);
     setUploadedFiles(stagedFiles); setLoadingStep(0);
 
     const stepInterval = setInterval(() => {
@@ -2043,6 +3106,34 @@ export default function App() {
       setDocumentText(data.document_text ?? '');
       setDocumentsText(data.documents_text ?? {});
       setChartsData(data.charts_data ?? null);
+
+      // Cache files in IDB so PDFs survive page refreshes
+      if (activeDealId) saveFilesToIDB(activeDealId, stagedFiles);
+
+      // Persist
+      if (activeDealId) {
+        // Save all documents
+        for (const f of stagedFiles) {
+          const text = data.documents_text?.[f.name] ?? '';
+          await saveDocument(activeDealId, f.name, getFileType(f.name), text);
+        }
+        // Save analysis (comps_data = null for now; updated after fetchComps)
+        await saveAnalysis(
+          activeDealId,
+          data.assessment, data.claims, data.cross_document_conflicts,
+          data.charts_data, null,
+        );
+        // Update deal verdict + timestamp
+        await saveDeal(activeDealId, { verdict: data.assessment.overall_verdict } as any);
+        setDeals(prev => prev.map(d =>
+          d.id === activeDealId
+            ? { ...d, verdict: data.assessment.overall_verdict, updated_at: new Date().toISOString() }
+            : d
+        ));
+      }
+
+      // Fire comps in background
+      fetchComps(data.assessment, data.document_text ?? '', sector);
     } catch (err) {
       setError("Something went wrong. Make sure the backend is running on port 8000 and try again.");
       console.error(err);
@@ -2051,15 +3142,61 @@ export default function App() {
     }
   };
 
-  if (results && uploadedFiles.length > 0) {
+  // ── Rendering ─────────────────────────────────────────────────
+  if (appView === 'home') {
+    return (
+      <>
+        <HomeScreen
+          deals={deals}
+          loading={dealsLoading}
+          onNewDeal={handleNewDeal}
+          onOpenDeal={handleOpenDeal}
+          onDeleteDeal={handleDeleteDeal}
+        />
+        {showNewDealModal && (
+          <NewDealModal
+            onConfirm={handleCreateDeal}
+            onCancel={() => setShowNewDealModal(false)}
+          />
+        )}
+      </>
+    );
+  }
+
+  // Deal workspace loading spinner
+  if (dealWorkspaceLoading) {
+    return (
+      <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: OFFWHITE, gap: 16 }}>
+        <style>{GLOBAL_STYLE}</style>
+        <div style={{ width: 36, height: 36, border: `3px solid #e5e7eb`, borderTop: `3px solid ${RED}`, borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
+        <p style={{ color: '#6b7280', fontSize: 13, fontFamily: "'Inter', sans-serif" }}>Loading deal…</p>
+      </div>
+    );
+  }
+
+  const hasResults = results !== null;
+  const hasDocs = uploadedFiles.length > 0 || savedDocEntries.length > 0;
+
+  if (hasResults && hasDocs) {
     return (
       <Results
-        data={results}
+        data={results!}
         uploadedFiles={uploadedFiles}
-        onReset={() => { setResults(null); setStagedFiles([]); setUploadedFiles([]); setDocumentText(''); setDocumentsText({}); setChartsData(null); }}
+        onReset={handleBackToHome}
         documentText={documentText}
         documentsText={documentsText}
         chartsData={chartsData}
+        compsData={compsData}
+        compsLoading={compsLoading}
+        savedDocEntries={savedDocEntries}
+        initialChatMessages={initialChatMessages}
+        dealName={activeDealName}
+        dealStatus={activeDealStatus}
+        onStatusChange={handleStatusChange}
+        onSaveChatMessage={handleSaveChatMessage}
+        saveError={saveError}
+        onBackToHome={handleBackToHome}
+        onDocumentExtracted={handleDocumentExtracted}
       />
     );
   }
@@ -2077,6 +3214,8 @@ export default function App() {
       onSectorChange={setSector}
       criteria={criteria}
       onCriteriaChange={setCriteria}
+      dealName={activeDealName || undefined}
+      onBackToHome={activeDealName ? handleBackToHome : undefined}
     />
   );
 }

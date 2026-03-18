@@ -568,6 +568,197 @@ async def analyze_cim(
     }
 
 
+def extract_deal_profile(assessment: dict, doc_text_preview: str, sector: str) -> dict:
+    """Use Claude to extract a searchable deal profile and generate targeted search queries."""
+    prompt = f"""You are a senior {sector} analyst. Extract a deal profile for comparable M&A transaction research.
+
+ASSESSMENT:
+Company snapshot: {assessment.get('company_snapshot', '')}
+Seller narrative: {assessment.get('sellers_narrative', '')}
+Reasoning: {assessment.get('reasoning', '')}
+Bull case: {assessment.get('bull_case', '')}
+
+DOCUMENT EXCERPT (first 5000 chars):
+{doc_text_preview[:5000]}
+
+Return ONLY valid JSON with no other text:
+{{
+  "sector": "broad sector (e.g. Gaming & Hospitality, Healthcare Services, Business Services, Industrial)",
+  "sub_sector": "specific sub-sector (e.g. Regional Casino, Behavioral Health, B2B SaaS, Specialty Manufacturing)",
+  "description": "2-sentence description for comp search context — be specific about size, geography, business model",
+  "revenue_millions": 385,
+  "ebitda_millions": 91,
+  "ebitda_margin_pct": 23.6,
+  "geography": "e.g. US Sunbelt, Western US, North America, Midwest",
+  "business_model": "e.g. asset-heavy, subscription, fee-based, project-based",
+  "search_queries": [
+    "4 specific search queries designed to surface real M&A transaction data with multiples"
+  ]
+}}
+
+For search_queries, write exactly 4 queries that will return actual deal data. Think like an analyst searching Bloomberg or PitchBook. Examples of good queries:
+- "regional casino acquisition enterprise value EBITDA multiple 2022 2023 2024"
+- "gaming hospitality private equity buyout deal value 2023 2024"
+- "casino resort sold acquisition announced deal price millions"
+- "comparable transactions regional gaming M&A EV EBITDA leveraged buyout"
+
+Tailor queries specifically to this sector and deal type. Use null for financial fields if genuinely unknown."""
+
+    try:
+        response = claude.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+    except Exception as e:
+        print(f"Error in extract_deal_profile: {e}")
+        raise
+
+
+def run_comps_searches(deal_profile: dict) -> list:
+    """Run Tavily searches for comparable M&A transactions."""
+    queries = deal_profile.get("search_queries", [])[:4]
+    all_results = []
+    for query in queries:
+        try:
+            response = requests.post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key": TAVILY_API_KEY,
+                    "query": query,
+                    "max_results": 5,
+                    "search_depth": "basic"
+                }
+            )
+            results = response.json().get("results", [])
+            for r in results:
+                all_results.append({
+                    "query": query,
+                    "title": r.get("title", ""),
+                    "url": r.get("url", ""),
+                    "content": r.get("content", "")[:600]
+                })
+        except Exception as e:
+            print(f"Tavily comps search error for '{query}': {e}")
+    return all_results
+
+
+def extract_comps_from_search(deal_profile: dict, search_results: list, sector: str) -> dict:
+    """Use Claude to extract structured comp data from search results with institutional rigor."""
+    revenue = deal_profile.get("revenue_millions")
+    ebitda = deal_profile.get("ebitda_millions")
+    margin = deal_profile.get("ebitda_margin_pct")
+
+    prompt = f"""You are a senior {sector} analyst at a top-tier investment bank. You have web search results for comparable M&A transactions. Extract structured comp data with the rigor you'd apply in a Goldman or Lazard pitch book.
+
+DEAL PROFILE (the target company being analyzed):
+Sector: {deal_profile.get('sector', 'Unknown')} / {deal_profile.get('sub_sector', '')}
+Description: {deal_profile.get('description', '')}
+Revenue: ${revenue}M | EBITDA: ${ebitda}M ({margin}% margin)
+Geography: {deal_profile.get('geography', 'Unknown')}
+Business model: {deal_profile.get('business_model', 'Unknown')}
+
+SEARCH RESULTS:
+{json.dumps(search_results, indent=2)}
+
+EXTRACTION RULES:
+1. Include ONLY real, confirmed M&A transactions found in the search results — not rumors, not projections, not public company trading multiples
+2. Be skeptical — if a transaction isn't clearly documented in the results, exclude it entirely
+3. Better 3 confirmed comps than 8 speculative ones
+4. If EV and EBITDA are both stated but the multiple isn't, calculate it; label derived figures
+5. For each comp, explain WHY it's comparable to THIS specific deal and the most important difference
+
+Return ONLY valid JSON with no other text:
+{{
+  "comps": [
+    {{
+      "company": "Target company name",
+      "acquirer": "Acquirer name or 'Undisclosed'",
+      "date": "Q1 2023 or just 2023",
+      "ev_millions": 850,
+      "ev_ebitda": 9.5,
+      "ev_revenue": 2.1,
+      "why_comparable": "1 sentence: the specific attribute that makes this comp directly relevant — be precise, name the similarity",
+      "key_difference": "1 sentence: the most important way this comp differs — size, geography, margin profile, asset quality, etc.",
+      "source_url": "url or null"
+    }}
+  ],
+  "sector_context": {{
+    "typical_ev_ebitda_low": 7.0,
+    "typical_ev_ebitda_high": 12.0,
+    "multiple_drivers": [
+      "specific driver of premium multiples in this sector (1 sentence)",
+      "another premium driver"
+    ],
+    "discount_drivers": [
+      "specific driver of discount multiples (1 sentence)",
+      "another discount driver"
+    ]
+  }},
+  "this_deal_positioning": {{
+    "implied_ev_ebitda": null,
+    "implied_ev_revenue": null,
+    "vs_comp_set": "In line | Premium | Discount | Cannot determine",
+    "rationale": "1-2 sentences on where this deal sits vs the comp set — be specific"
+  }},
+  "valuation_context": "2-3 paragraph written synthesis — the quality of a pitch book page. What do these comps tell us about this deal's valuation? Cite specific comps by name. What would justify a premium or discount relative to the median? What should the buyer push back on? Be direct, no hedging.",
+  "data_quality_note": "1 sentence noting that comps are sourced from public web data and may be incomplete or inaccurate — analysts should verify with PitchBook, CapIQ, or Bloomberg before using in any IC memo."
+}}
+
+CRITICAL: Only include comps with real data confirmed in the search results. If fewer than 3 credible comps are found, return what you found and be transparent about the gap."""
+
+    try:
+        response = claude.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=3500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw.strip())
+        result["deal_profile"] = deal_profile
+        return result
+    except Exception as e:
+        print(f"Error in extract_comps_from_search: {e}")
+        raise
+
+
+@app.post("/comps")
+async def get_comparable_transactions(
+    assessment_json: str = Form(...),
+    document_text_preview: str = Form(default=""),
+    sector: str = Form(default="Private Equity"),
+):
+    """
+    Comparable transaction analysis. Called by the frontend after /analyze completes.
+    Runs independently so main analysis results are not blocked.
+    """
+    try:
+        assessment = json.loads(assessment_json)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid assessment JSON")
+
+    # Step 1: Extract deal profile + generate targeted search queries
+    deal_profile = extract_deal_profile(assessment, document_text_preview, sector)
+
+    # Step 2: Run Tavily searches
+    search_results = run_comps_searches(deal_profile)
+
+    # Step 3: Extract structured comps from search results
+    comps_data = extract_comps_from_search(deal_profile, search_results, sector)
+
+    return comps_data
+
+
 @app.post("/extract")
 async def extract_document(file: UploadFile = File(...)):
     """Extract text from a single document (PDF only). Used by the file explorer to add documents."""
