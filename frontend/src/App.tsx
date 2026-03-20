@@ -14,7 +14,7 @@ import {
   PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer,
 } from 'recharts';
 
-const BACKEND_URL = "http://localhost:8000";
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
 
 // ── IndexedDB file cache ──────────────────────────────────────
 // Persists File binaries across page refreshes, keyed by deal ID.
@@ -1444,7 +1444,7 @@ function FileExplorer({ docState, docDispatch, collapsed, onToggle, onDocumentEx
       try {
         const formData = new FormData();
         formData.append('file', entry.file!);
-        const { data } = await axios.post<{ text: string }>(`${BACKEND_URL}/extract`, formData, {
+        const { data } = await axios.post<{ text: string }>(`${API_BASE_URL}/extract`, formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
         });
         docDispatch({ type: 'SET_EXTRACTED_TEXT', payload: { name: entry.name, text: data.text } });
@@ -2345,7 +2345,7 @@ function Results({
       formData.append('document_text', allDocText || documentText);
       formData.append('history', JSON.stringify(historySnapshot));
       formData.append('document_names', docStateRef.current.documents.map(d => d.name).join(', '));
-      const { data: resp } = await axios.post<{ response: string }>(`${BACKEND_URL}/chat`, formData, {
+      const { data: resp } = await axios.post<{ response: string }>(`${API_BASE_URL}/chat`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
       const assistantMsg: ChatMessage = {
@@ -3060,7 +3060,7 @@ export default function App() {
       fd.append("assessment_json", JSON.stringify(assessment));
       fd.append("document_text_preview", docTextPreview.slice(0, 8000));
       fd.append("sector", activeSector);
-      const { data } = await axios.post<CompsData>(`${BACKEND_URL}/comps`, fd, {
+      const { data } = await axios.post<CompsData>(`${API_BASE_URL}/comps`, fd, {
         headers: { "Content-Type": "multipart/form-data" }, timeout: 180000,
       });
       setCompsData(data);
@@ -3099,7 +3099,7 @@ export default function App() {
       formData.append("deal_size_range", criteria.dealSizeRange);
       formData.append("target_sectors", criteria.targetSectors);
       formData.append("geography", criteria.geography);
-      const { data } = await axios.post<AnalysisResult>(`${BACKEND_URL}/analyze`, formData, {
+      const { data } = await axios.post<AnalysisResult>(`${API_BASE_URL}/analyze`, formData, {
         headers: { "Content-Type": "multipart/form-data" }, timeout: 300000,
       });
       setResults(data);
@@ -3135,7 +3135,7 @@ export default function App() {
       // Fire comps in background
       fetchComps(data.assessment, data.document_text ?? '', sector);
     } catch (err) {
-      setError("Something went wrong. Make sure the backend is running on port 8000 and try again.");
+      setError("Something went wrong. Make sure the backend is running and try again.");
       console.error(err);
     } finally {
       clearInterval(stepInterval); setLoading(false);
