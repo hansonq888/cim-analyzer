@@ -184,6 +184,7 @@ interface ChatMessage {
   timestamp?: string;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 interface UploadedDocument {
   file: File;
   name: string;
@@ -308,6 +309,7 @@ const sectionLabel: React.CSSProperties = {
 };
 
 // ── Collapsible Section ──────────────────────────────────────
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function CollapsibleSection({
   title, defaultOpen = true, count, action, children,
 }: {
