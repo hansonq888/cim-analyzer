@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import pdfplumber
+import openpyxl
 import anthropic
 import requests
 import json
@@ -29,41 +30,39 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-SECTOR_EXTRACT_FOCUS = {
-    "Private Equity": (
-        "Focus on: EBITDA margins and growth, revenue CAGR, customer concentration (top 10 customers as % of revenue), "
-        "market share claims, competitive moat, and any exit comparable references."
-    ),
-    "Private Credit": (
-        "Focus on: EBITDA and free cash flow figures, leverage multiples, interest coverage ratios, "
-        "debt capacity claims, downside scenario references, and any covenant or liquidity mentions."
-    ),
-    "Venture Capital": (
-        "Focus on: TAM/SAM size claims, MoM/YoY growth rates, unit economics (CAC, LTV, payback period), "
-        "team background claims, and market share or competitive positioning assertions."
-    ),
-    "Real Estate": (
-        "Focus on: cap rate claims, NOI figures, occupancy rates, market rent vs. in-place rent, "
-        "lease term and tenant quality claims, and market comparable references."
-    ),
-}
-
-SECTOR_ANALYZE_LENS = {
-    "Private Equity": (
-        "Apply a PE lens: flag anything relevant to multiple expansion potential, operational improvement levers, "
-        "or exit comparable credibility."
-    ),
-    "Private Credit": (
-        "Apply a credit lens: flag anything relevant to EBITDA coverage ratios, debt capacity, downside scenarios, "
-        "or covenant headroom."
-    ),
-    "Venture Capital": (
-        "Apply a VC lens: flag market size credibility, team background verifiability, and growth rate sustainability."
-    ),
-    "Real Estate": (
-        "Apply a real estate lens: flag cap rate assumptions, occupancy claims vs. market, "
-        "and rent comparables."
-    ),
+STRATEGY_LENS = {
+    "Private Equity": {
+        "focus": "LBO returns, EBITDA growth trajectory, management quality, competitive moat, exit multiple expansion potential",
+        "key_metrics": "EBITDA margins, revenue growth CAGR, CapEx intensity, working capital, leverage capacity",
+        "red_flags": "customer concentration, management turnover, declining margins, covenant-heavy balance sheet, cyclical exposure",
+        "verdict_criteria": "Would this generate 20%+ IRR in a 5-year hold? Is there a credible value creation thesis beyond financial engineering?",
+        "questions_focus": "management incentives, add-on acquisition pipeline, margin improvement levers, exit options",
+        "conflict_focus": "revenue and EBITDA figures, margin trends, CapEx projections, customer concentration percentages",
+    },
+    "Private Credit": {
+        "focus": "debt service coverage, downside protection, asset coverage, covenant structure, refinancing risk",
+        "key_metrics": "DSCR, interest coverage ratio, leverage ratio, free cash flow conversion, asset coverage ratio",
+        "red_flags": "deteriorating coverage ratios, covenant-lite structure, single asset concentration, cyclical cash flows, aggressive projections",
+        "verdict_criteria": "Can this company service the debt through a downturn? What's the recovery value if it can't?",
+        "questions_focus": "covenant package, security structure, refinancing timeline, stress case cash flows, intercreditor arrangements",
+        "conflict_focus": "cash flow figures, leverage ratios, debt capacity claims, coverage ratios, collateral valuations",
+    },
+    "Venture Capital": {
+        "focus": "market size, growth rate, founder quality, product differentiation, path to profitability",
+        "key_metrics": "ARR growth, net revenue retention, CAC/LTV ratio, burn multiple, gross margins",
+        "red_flags": "slowing growth, high burn with no path to profitability, weak retention, crowded market, founder conflicts",
+        "verdict_criteria": "Can this be a $1B+ outcome? Is the team exceptional? Is the market timing right?",
+        "questions_focus": "competitive differentiation, go-to-market efficiency, key person risk, next funding milestone",
+        "conflict_focus": "ARR and growth rate figures, user or customer counts, burn rate and runway, TAM estimates",
+    },
+    "Real Estate": {
+        "focus": "NOI stability, cap rate, occupancy trends, debt service coverage, market dynamics",
+        "key_metrics": "cap rate, NOI yield, DSCR, occupancy rate, rent per square foot, vacancy rate",
+        "red_flags": "tenant concentration, lease expiry clustering, deferred maintenance, market oversupply, floating rate exposure",
+        "verdict_criteria": "Does the yield justify the risk? What's the downside if occupancy drops 20%?",
+        "questions_focus": "lease terms, tenant quality, market comparable rents, capital expenditure needs, exit cap rate assumptions",
+        "conflict_focus": "NOI figures, occupancy rates, cap rates, rent per square foot, lease term lengths, property valuations",
+    },
 }
 
 
@@ -156,9 +155,62 @@ def extract_pdf_text(file_bytes: bytes) -> str:
     return extraction_note + "\n".join(pages_text)
 
 
+def extract_excel_text(file_bytes: bytes) -> str:
+    """
+    Extract structured text from an Excel workbook.
+    Each sheet becomes a labelled section with its data rendered as a pipe-delimited table.
+    Empty sheets and purely formatting sheets are skipped.
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    sections = []
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+
+        # Collect all rows that have at least one non-empty cell
+        rows = []
+        for row in ws.iter_rows(values_only=True):
+            cleaned = [str(cell).strip() if cell is not None else "" for cell in row]
+            if any(c for c in cleaned):  # skip fully blank rows
+                rows.append(cleaned)
+
+        if not rows:
+            continue
+
+        # Trim trailing empty columns across all rows
+        max_cols = max(len(r) for r in rows)
+        last_nonempty_col = 0
+        for r in rows:
+            for ci in range(len(r) - 1, -1, -1):
+                if r[ci]:
+                    last_nonempty_col = max(last_nonempty_col, ci)
+                    break
+        rows = [r[:last_nonempty_col + 1] for r in rows]
+
+        # Render as pipe-delimited table
+        table_lines = [" | ".join(row) for row in rows]
+        sections.append(f"=== SHEET: {sheet_name} ===\n" + "\n".join(table_lines))
+
+    if not sections:
+        return "[No extractable data in this Excel file]"
+
+    return (
+        "EXCEL EXTRACTION NOTE: Values are read directly from cells (not formulas). "
+        "Percentages and numbers appear as stored in the model.\n\n"
+        + "\n\n".join(sections)
+    )
+
+
 def extract_all_documents_text(files_bytes: list[tuple[str, bytes]]) -> dict:
-    """Returns {filename: extracted_text} for all uploaded files."""
-    return {filename: extract_pdf_text(data) for filename, data in files_bytes}
+    """Returns {filename: extracted_text} for all uploaded files, routing by extension."""
+    result = {}
+    for filename, data in files_bytes:
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if ext in ("xlsx", "xls", "xlsm"):
+            result[filename] = extract_excel_text(data)
+        else:
+            result[filename] = extract_pdf_text(data)
+    return result
 
 
 def assemble_document_text(documents: dict, char_limit: int = 80000) -> str:
@@ -198,7 +250,7 @@ def assemble_document_text(documents: dict, char_limit: int = 80000) -> str:
 
 
 def extract_claims(text: str, sector: str, criteria_context: str = "") -> list:
-    sector_focus = SECTOR_EXTRACT_FOCUS.get(sector, SECTOR_EXTRACT_FOCUS["Private Equity"])
+    lens = STRATEGY_LENS.get(sector, STRATEGY_LENS["Private Equity"])
     # Only inject criteria block when non-empty; cap at 500 chars to avoid bloat
     criteria_section = ""
     if criteria_context and criteria_context.strip():
@@ -206,14 +258,17 @@ def extract_claims(text: str, sector: str, criteria_context: str = "") -> list:
 
     prompt = (
         f"You are a senior {sector} analyst doing a first-pass on a CIM.\n\n"
+        f"Investment strategy: {sector}\n"
+        f"Analysis focus: {lens['focus']}\n"
+        f"Key metrics to prioritize: {lens['key_metrics']}\n"
+        f"Red flags to watch for: {lens['red_flags']}\n\n"
         "Extract the 6 MOST IMPACTFUL verifiable claims — the ones that would actually change whether you pursue this deal.\n\n"
         "Prioritize (in order of importance):\n"
         "1. Revenue / EBITDA / margin claims with specific numbers\n"
         "2. Market size and growth rate claims\n"
         "3. Competitive position claims (market share, named moat)\n"
         "4. Customer concentration claims\n"
-        "5. Key operational metrics\n\n"
-        f"{sector_focus}"
+        "5. Key operational metrics relevant to the strategy above\n\n"
         f"{criteria_section}\n"
         "Skip: vague qualitative statements, mission statements, aspirational language, "
         "anything that cannot be fact-checked against external data.\n\n"
@@ -265,7 +320,7 @@ def search_claim(claim: str) -> list:
 
 
 def analyze_claim(claim: dict, search_results: list, sector: str) -> dict:
-    sector_lens = SECTOR_ANALYZE_LENS.get(sector, SECTOR_ANALYZE_LENS["Private Equity"])
+    lens = STRATEGY_LENS.get(sector, STRATEGY_LENS["Private Equity"])
 
     try:
         response = claude.messages.create(
@@ -277,7 +332,7 @@ def analyze_claim(claim: dict, search_results: list, sector: str) -> dict:
 
 CLAIM: "{claim['claim']}"
 WHY IT MATTERS: "{claim.get('why_it_matters', '')}"
-SECTOR LENS: {sector_lens}
+{sector} ANALYSIS LENS: Focus on {lens['focus']}. Watch for red flags: {lens['red_flags']}.
 
 SEARCH RESULTS:
 {json.dumps(search_results, indent=2)}
@@ -325,18 +380,17 @@ def find_cross_document_conflicts(documents: dict, sector: str) -> list:
                 "role": "user",
                 "content": f"""You are a senior {sector} analyst reviewing multiple documents from the same deal package. Your job is to find every numerical contradiction between these documents. Be aggressive — if two documents state different numbers for the same metric, that is a conflict and must be flagged.
 
+For a {sector} deal, pay closest attention to discrepancies in: {STRATEGY_LENS.get(sector, STRATEGY_LENS["Private Equity"])['conflict_focus']}.
+
 Scan every document exhaustively for these specific data points, then compare across documents:
 
 NUMERICAL (flag any mismatch, no matter how small):
 - Revenue figures (LTM, projected, historical) — exact dollar amounts
 - EBITDA and EBITDA margins — exact dollar amounts and percentages
-- Slot machine counts and table game counts
-- Hotel room counts and hotel capacity figures
-- Market growth rates and visitor/traffic numbers
+- Key operational metrics (unit counts, headcount, capacity figures)
+- Market growth rates and size estimates
 - Capital expenditure totals and project budgets
-- Land acreage and property size claims
-- Headcount and employee figures
-- Customer concentration percentages
+- Customer or tenant concentration percentages
 - Any other specific dollar, unit, or percentage figures
 
 NARRATIVE (flag direct contradictions):
@@ -348,16 +402,22 @@ NARRATIVE (flag direct contradictions):
 DOCUMENTS:
 {doc_blocks}
 
+CRITICAL — CITATION RULES:
+- For PDF/presentation documents: use [[Page X, filename]] citations. Page numbers come from the ====PAGE X OF Y==== markers only — never from printed numbers in the content.
+- For Excel spreadsheets (.xlsx/.xls): use [[Sheet: SheetName, filename]] citations (e.g. [[Sheet: P&L Summary, model.xlsx]]). Excel documents have === SHEET: Name === markers — use the sheet name exactly as shown.
+
 Return ONLY a valid JSON array. If no real contradictions exist, return []. Do not manufacture contradictions — only flag genuine discrepancies where two documents state different values for the same thing.
 
 [
   {{
     "doc1": "exact filename as shown above",
     "doc2": "exact filename as shown above",
-    "claim1": "what doc1 specifically states, including the exact number",
-    "claim2": "what doc2 specifically states, including the exact number",
+    "claim1": "what doc1 specifically states with its citation — use [[Page X, doc1_filename]] for PDFs or [[Sheet: SheetName, doc1_filename]] for Excel",
+    "claim2": "what doc2 specifically states with its citation — use [[Page X, doc2_filename]] for PDFs or [[Sheet: SheetName, doc2_filename]] for Excel",
     "severity": "high | medium | low",
-    "explanation": "1 sentence: the specific discrepancy and why it matters to the investment decision"
+    "explanation": "1 sentence: the specific discrepancy and why it matters. Include citations.",
+    "page1": <integer page number for PDF doc1, or null if doc1 is Excel>,
+    "page2": <integer page number for PDF doc2, or null if doc2 is Excel>
   }}
 ]
 
@@ -401,6 +461,7 @@ Severity:
 
 
 def get_overall_assessment(claims_with_verdicts: list, sector: str, criteria_context: str = "") -> dict:
+    lens = STRATEGY_LENS.get(sector, STRATEGY_LENS["Private Equity"])
     criteria_section = f"\n{criteria_context}\n" if criteria_context else ""
     criteria_fit_field = ""
     if criteria_context:
@@ -417,7 +478,10 @@ def get_overall_assessment(claims_with_verdicts: list, sector: str, criteria_con
                 "role": "user",
                 "content": f"""You are a senior Sagard {sector} analyst. You just read this CIM on the train and are giving a 2-minute verbal briefing to a partner. Be direct, specific, no fluff. Sound like a sharp senior associate — not a report.
 
-SECTOR: {sector}
+INVESTMENT STRATEGY: {sector}
+Verdict criteria: {lens['verdict_criteria']}
+Key metrics to assess: {lens['key_metrics']}
+Red flags that would kill this deal: {lens['red_flags']}
 {criteria_section}
 CLAIMS ANALYSIS:
 {json.dumps(claims_with_verdicts, indent=2)}
@@ -784,12 +848,16 @@ async def get_comparable_transactions(
 
 @app.post("/extract")
 async def extract_document(file: UploadFile = File(...)):
-    """Extract text from a single document (PDF only). Used by the file explorer to add documents."""
+    """Extract text from a single document (PDF or Excel). Used by the file explorer to add documents."""
     content = await file.read()
     filename = file.filename or "document.pdf"
-    if not filename.lower().endswith(".pdf"):
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext in ("xlsx", "xls", "xlsm"):
+        text = extract_excel_text(content)
+    elif ext == "pdf":
+        text = extract_pdf_text(content)
+    else:
         return {"text": ""}
-    text = extract_pdf_text(content)
     return {"text": text}
 
 
@@ -804,15 +872,26 @@ async def chat_with_documents(
     document_text: str = Form(...),
     history: str = Form(default="[]"),
     document_names: str = Form(default=""),
+    sector: str = Form(default="Private Equity"),
 ):
     try:
         conversation_history = json.loads(history)
     except json.JSONDecodeError:
         conversation_history = []
 
+    lens = STRATEGY_LENS.get(sector, STRATEGY_LENS["Private Equity"])
     doc_names_str = f"\nAvailable documents: {document_names}" if document_names else ""
 
-    system_prompt = f"""You are a senior investment analyst assistant at a private equity and credit firm. You have been given the full text of deal documents. Your job is to answer questions with the precision and skepticism of an experienced analyst.
+    system_prompt = f"""You are a senior {sector} analyst assistant. You have been given the full text of deal documents and are advising an investor evaluating this deal from a {sector} perspective.
+
+Your analytical lens: {lens['focus']}
+Key metrics you care about: {lens['key_metrics']}
+Red flags you watch for: {lens['red_flags']}
+The core question you're answering: {lens['verdict_criteria']}
+
+When answering questions, apply this {sector} lens — don't give generic investment analysis. A {sector} investor asking about cash flow wants to know about {lens['questions_focus']}, not a generic financial summary.
+
+Your job is to answer questions with the precision and skepticism of an experienced {sector} analyst.
 
 CRITICAL — PAGE NUMBER INSTRUCTIONS:
 The document text contains explicit page markers in this format:
@@ -832,12 +911,19 @@ Additional rules:
 
 CITATION FORMAT — MANDATORY:
 You MUST use double square brackets for ALL citations. Never use single brackets.{doc_names_str}
-For EVERY document citation, always include the exact document name from the Available documents list above: [[Page X, ExactDocumentName]].
+
+For PDF/presentation documents, cite by page: [[Page X, ExactDocumentName]]
+For Excel spreadsheets (.xlsx/.xls), cite by sheet name: [[Sheet: SheetName, ExactDocumentName]]
+
 Never use generic names like "CIM", "the document", "Main Document", or "primary document" — always use the actual filename.
-For example, if the file is called "American-casinos-CIM.pdf", cite it as [[Page 35, American-casinos-CIM]], not [[Page 35, CIM]].
+Examples:
+- PDF: [[Page 35, American-casinos-CIM.pdf]]
+- Excel: [[Sheet: P&L Summary, ACEP_Financial_Model.xlsx]]
+- Excel: [[Sheet: Debt Schedule, ACEP_Financial_Model.xlsx]]
+
 Every factual claim you make must be followed by a citation in this exact format.
-If you reference a specific number, quote, or finding, always cite its source location.
-If information comes from multiple pages, cite all of them: [[Page 12, DocName]] [[Page 35, DocName]].
+If a number comes from an Excel sheet, always cite the sheet name so the reader can navigate there directly.
+If information comes from multiple sources, cite all of them.
 If you cannot find something in the documents, say explicitly: "This information is not in the provided documents."
 
 CHART RULES:

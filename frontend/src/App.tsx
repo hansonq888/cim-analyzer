@@ -1,4 +1,5 @@
 import { useState, useCallback, useRef, useEffect, useReducer } from "react";
+import * as XLSX from "xlsx";
 import { useDealPersistence, Deal } from "./useDealPersistence";
 import type { LoadedDealData } from "./useDealPersistence";
 import { isSupabaseConfigured } from "./supabaseClient";
@@ -120,6 +121,8 @@ interface CrossDocumentConflict {
   claim1: string; claim2: string;
   severity: "high" | "medium" | "low";
   explanation: string;
+  page1?: number | null;
+  page2?: number | null;
 }
 
 interface AnalysisResult {
@@ -219,11 +222,12 @@ const severityConfig = {
 };
 
 const LOADING_STEPS = [
-  "Extracting text from CIM...",
-  "Identifying key claims...",
-  "Searching live sources...",
-  "Analyzing each claim...",
-  "Building assessment...",
+  "Extracting document text",
+  "Identifying key claims",
+  "Verifying market data",
+  "Running cross-document analysis",
+  "Generating assessment",
+  "Building comparable transactions",
 ];
 
 // ── File type helpers ─────────────────────────────────────────
@@ -239,9 +243,9 @@ function getFileType(name: string): FileType {
 
 function getFileIcon(type: FileType): string {
   switch (type) {
-    case 'xlsx': return '📊';
-    case 'pptx': return '📑';
-    default: return '📄';
+    case 'xlsx': return 'XLS';
+    case 'pptx': return 'PPT';
+    default: return 'PDF';
   }
 }
 
@@ -280,19 +284,20 @@ const dealVerdictPill: Record<string, { bg: string; color: string; border: strin
   'Pass':              { bg: '#fdf2f2', color: '#991b1b', border: '#fecaca' },
 };
 
-const FONT_STACK = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
+const FONT_STACK = "'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 
 const GLOBAL_STYLE = `
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; font-family: inherit; }
-  body { font-family: ${FONT_STACK}; background: ${OFFWHITE}; color: ${NAVY}; -webkit-font-smoothing: antialiased; }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Open Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+  body { font-family: ${FONT_STACK}; background: ${OFFWHITE}; color: ${NAVY}; -webkit-font-smoothing: antialiased; font-size: 13px; line-height: 1.6; }
   a:hover { opacity: 0.8; }
   textarea:focus { outline: 1px solid ${RED}; border-color: transparent; }
+  input:focus, select:focus { outline: none; border-color: ${RED} !important; }
   .react-pdf__Page { display: block !important; }
   input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
   input, select, textarea, button { font-family: inherit; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes pulse { 0%, 100% { opacity: 0.3; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
+  @keyframes stepOn { from { opacity: 0.4; } to { opacity: 1; } }
 `;
 
 // ── Utilities ────────────────────────────────────────────────
@@ -304,8 +309,8 @@ function formatBytes(b: number) {
 
 const sectionLabel: React.CSSProperties = {
   fontFamily: FONT_STACK,
-  fontSize: 10, fontWeight: 700, color: RED,
-  textTransform: "uppercase", letterSpacing: "2px",
+  fontSize: 10, fontWeight: 600, color: RED,
+  textTransform: "uppercase", letterSpacing: "1.5px",
 };
 
 // ── Collapsible Section ──────────────────────────────────────
@@ -351,6 +356,7 @@ interface UploadZoneProps {
   files: File[];
   onAddFiles: (f: File[]) => void;
   onRemoveFile: (i: number) => void;
+  onSetPrimary: (i: number) => void;
   onAnalyze: () => void;
   loading: boolean;
   loadingStep: number;
@@ -364,23 +370,29 @@ interface UploadZoneProps {
 }
 
 function UploadZone({
-  files, onAddFiles, onRemoveFile, onAnalyze, loading, loadingStep,
+  files, onAddFiles, onRemoveFile, onSetPrimary, onAnalyze, loading, loadingStep,
   error, sector, onSectorChange, criteria, onCriteriaChange,
   dealName, onBackToHome,
 }: UploadZoneProps) {
-  const [criteriaOpen, setCriteriaOpen] = useState(false);
-
   const onDrop = useCallback((accepted: File[]) => {
     if (accepted.length) onAddFiles(accepted);
   }, [onAddFiles]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
-    onDrop, accept: { "application/pdf": [".pdf"] }, multiple: true, disabled: loading,
+    onDrop,
+    accept: {
+      "application/pdf": [".pdf"],
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+      "application/vnd.ms-excel": [".xls"],
+      "application/vnd.ms-excel.sheet.macroEnabled.12": [".xlsm"],
+    },
+    multiple: true,
+    disabled: loading,
   });
 
   const inputStyle: React.CSSProperties = {
-    width: "100%", padding: "9px 12px", borderRadius: 6,
-    border: "1px solid #e5e7eb", fontSize: 13, fontFamily: "'Inter', sans-serif",
+    width: "100%", padding: "8px 12px", borderRadius: 6,
+    border: "1px solid #e5e7eb", fontSize: 13, fontFamily: FONT_STACK,
     background: "#fff", color: NAVY, outline: "none",
   };
 
@@ -388,176 +400,190 @@ function UploadZone({
     <div style={{ minHeight: "100vh", background: OFFWHITE }}>
       <style>{GLOBAL_STYLE}</style>
 
-      {/* Nav bar — shown when inside a deal workspace */}
-      {dealName && onBackToHome && (
-        <div style={{
-          background: NAVY, color: "#fff", display: "flex", alignItems: "center",
-          padding: "0 24px", height: 52, gap: 16,
-        }}>
-          <button
-            onClick={onBackToHome}
-            style={{
-              background: "none", border: "none", color: "#9ca3af", fontSize: 13,
-              cursor: "pointer", fontFamily: "'Inter', sans-serif", padding: "4px 0",
-              display: "flex", alignItems: "center", gap: 6,
-            }}
-          >
-            ← All Deals
-          </button>
-          <div style={{ width: 1, height: 20, background: "#374151" }} />
-          <div style={{
-            background: RED, color: "#fff", fontFamily: "'Inter', sans-serif",
-            fontWeight: 800, fontSize: 12, padding: "4px 12px", borderRadius: 3, letterSpacing: "2px",
-          }}>
-            SAGARD
-          </div>
-          <span style={{ color: "#e5e7eb", fontSize: 14, fontFamily: "'Inter', sans-serif", fontWeight: 500 }}>
-            {dealName}
-          </span>
-        </div>
-      )}
+      {/* Nav bar */}
+      <div style={{ height: 52, background: "#fff", borderBottom: "1px solid #e5e7eb", display: "flex", alignItems: "center", padding: "0 24px", gap: 14, flexShrink: 0 }}>
+        {onBackToHome && (
+          <>
+            <button onClick={onBackToHome} style={{ background: "none", border: "none", color: "#6b7280", fontSize: 13, cursor: "pointer", fontFamily: FONT_STACK, padding: 0, display: "flex", alignItems: "center", gap: 4, fontWeight: 500 }}>
+              ← Back
+            </button>
+            <div style={{ width: 1, height: 22, background: "#e5e7eb" }} />
+          </>
+        )}
+        <img src={`${process.env.PUBLIC_URL}/sagard.svg`} alt="Sagard" style={{ height: 26 }} />
+        {dealName && (
+          <>
+            <div style={{ width: 1, height: 22, background: "#e5e7eb" }} />
+            <span style={{ fontSize: 13, fontWeight: 600, color: NAVY, fontFamily: FONT_STACK }}>{dealName}</span>
+            <span style={{ fontSize: 10, fontWeight: 600, background: "#f5f5f5", color: "#6b7280", border: "1px solid #e5e7eb", borderRadius: 4, padding: "2px 8px", fontFamily: FONT_STACK }}>{sector}</span>
+          </>
+        )}
+      </div>
 
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", padding: "40px 24px" }}>
-      <div style={{ width: "100%", maxWidth: 540 }}>
-        {/* Wordmark */}
-        <div style={{ textAlign: "center", marginBottom: 40 }}>
-          <div style={{
-            display: "inline-block", background: RED, color: "#fff",
-            fontFamily: "'Inter', sans-serif", fontWeight: 800, fontSize: 15,
-            padding: "11px 32px", borderRadius: 4, letterSpacing: "3px", marginBottom: 20,
-          }}>
-            SAGARD
-          </div>
-          <h1 style={{ fontFamily: "'Inter', sans-serif", fontSize: 32, fontWeight: 800, color: NAVY, margin: "0 0 8px", letterSpacing: "-0.5px" }}>
-            CIM Analyzer
-          </h1>
-          <p style={{ color: "#6b7280", fontSize: 13, margin: 0, fontFamily: "'Inter', sans-serif" }}>
-            AI-powered first-pass investment analysis
-          </p>
-        </div>
-
-        {/* Drop zone */}
-        <div
-          {...getRootProps()}
-          style={{
-            border: `2px dashed ${isDragActive ? RED : "#c8c0b8"}`,
-            borderRadius: 8, padding: files.length ? "20px 28px" : "48px 28px",
-            textAlign: "center", background: isDragActive ? "#fdf5f5" : "#fff",
-            cursor: loading ? "not-allowed" : "pointer", transition: "all 0.2s",
-          }}
-        >
-          <input {...getInputProps()} />
-          {loading ? (
-            <div>
-              <div style={{ width: 34, height: 34, border: `3px solid #e5e7eb`, borderTop: `3px solid ${RED}`, borderRadius: "50%", animation: "spin 1s linear infinite", margin: "0 auto 14px" }} />
-              <p style={{ color: RED, fontWeight: 600, fontSize: 14, margin: "0 0 5px", fontFamily: "'Inter', sans-serif" }}>
-                {LOADING_STEPS[loadingStep] ?? "Analyzing..."}
-              </p>
-              <p style={{ color: "#9ca3af", fontSize: 12, margin: 0 }}>This takes about 60–90 seconds</p>
+      {loading ? (
+        /* ── Loading state: step-by-step progress ── */
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: "calc(100vh - 52px)", padding: "40px 20px" }}>
+          <div style={{ width: "100%", maxWidth: 460 }}>
+            <p style={{ margin: "0 0 4px", ...sectionLabel, textAlign: "left" }}>ANALYZING DEAL</p>
+            <div style={{ borderBottom: "2px solid #e5e7eb", marginBottom: 28 }} />
+            <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+              {LOADING_STEPS.map((step, i) => {
+                const isDone = i < loadingStep;
+                const isActive = i === loadingStep;
+                return (
+                  <div key={step} style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <div style={{ width: 10, height: 10, borderRadius: "50%", flexShrink: 0, background: isDone || isActive ? RED : "#e5e7eb", transition: "background 0.4s" }} />
+                    <span style={{ fontSize: 13, fontFamily: FONT_STACK, color: isDone || isActive ? NAVY : "#9ca3af", fontWeight: isDone || isActive ? 600 : 400, transition: "color 0.4s", flex: 1 }}>
+                      {step}
+                    </span>
+                    {isDone && <span style={{ fontSize: 10, color: "#16a34a", fontFamily: FONT_STACK, fontWeight: 600, letterSpacing: "0.5px" }}>Done</span>}
+                    {isActive && <span style={{ fontSize: 10, color: RED, fontFamily: FONT_STACK, fontWeight: 600, letterSpacing: "0.5px" }}>Running</span>}
+                  </div>
+                );
+              })}
             </div>
-          ) : (
+            <p style={{ marginTop: 32, fontSize: 12, color: "#9ca3af", fontFamily: FONT_STACK, textAlign: "center" }}>Estimated time: 1–5 minutes</p>
+          </div>
+        </div>
+      ) : (
+        /* ── Main setup UI ── */
+        <div style={{ padding: "36px 40px", maxWidth: 980, margin: "0 auto" }}>
+          <p style={{ margin: "0 0 4px", fontSize: 24, fontWeight: 700, color: NAVY, fontFamily: FONT_STACK, letterSpacing: "-0.5px" }}>Deal Setup</p>
+          <div style={{ borderBottom: "2px solid #e5e7eb", marginBottom: 28 }} />
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 40 }}>
+
+            {/* Left: Documents */}
             <div>
-              <div style={{ fontSize: 26, marginBottom: 10 }}>📄</div>
-              <p style={{ color: NAVY, fontWeight: 600, fontSize: 14, margin: "0 0 4px", fontFamily: "'Inter', sans-serif" }}>
-                {isDragActive ? "Drop PDFs here" : files.length ? "Drop more documents to add" : "Drag & drop PDFs here"}
-              </p>
-              <p style={{ color: "#9ca3af", fontSize: 12, margin: "0 0 14px" }}>or click to browse</p>
-              {!files.length && (
-                <button style={{ background: RED, color: "#fff", border: "none", borderRadius: 6, padding: "9px 22px", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "'Inter', sans-serif" }}>
-                  Select PDF
-                </button>
+              <p style={{ margin: "0 0 12px", ...sectionLabel }}>DOCUMENTS</p>
+              <div
+                {...getRootProps()}
+                style={{
+                  border: `1px dashed ${isDragActive ? RED : "#e5e7eb"}`,
+                  borderRadius: 6, padding: files.length ? "16px 20px" : "32px 20px",
+                  textAlign: "center", background: isDragActive ? "#fdf5f5" : "#fff",
+                  cursor: "pointer", transition: "all 0.15s", marginBottom: files.length ? 10 : 0,
+                }}
+              >
+                <input {...getInputProps()} />
+                <p style={{ margin: "0 0 4px", color: NAVY, fontWeight: 600, fontSize: 13, fontFamily: FONT_STACK }}>
+                  {isDragActive ? "Drop documents here" : "Drop documents here or browse"}
+                </p>
+                <p style={{ margin: 0, fontSize: 11, color: "#9ca3af", fontFamily: FONT_STACK }}>
+                  PDF or Excel — CIM, management presentations, financial models
+                </p>
+              </div>
+
+              {files.length > 0 && (
+                <div>
+                  {files.map((f, i) => {
+                    const ftype = getFileType(f.name);
+                    const badge = getTypeBadgeColor(ftype);
+                    const isPrimary = i === 0;
+                    return (
+                      <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "#fff", border: `1px solid ${isPrimary ? RED : "#e5e7eb"}`, borderLeft: `3px solid ${isPrimary ? RED : "#e5e7eb"}`, borderRadius: 6, padding: "8px 12px", marginBottom: 5 }}>
+                        <span style={{ fontSize: 9, fontWeight: 700, padding: "2px 5px", borderRadius: 3, background: badge.bg, color: badge.color, fontFamily: FONT_STACK, textTransform: "uppercase" as const, flexShrink: 0 }}>
+                          {ftype.toUpperCase()}
+                        </span>
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <p style={{ margin: 0, fontSize: 12, fontWeight: 600, color: NAVY, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontFamily: FONT_STACK }}>{f.name}</p>
+                          <p style={{ margin: 0, fontSize: 10, color: "#9ca3af", fontFamily: FONT_STACK }}>{formatBytes(f.size)}</p>
+                        </div>
+                        {isPrimary ? (
+                          <span style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase" as const, letterSpacing: "0.5px", padding: "2px 8px", borderRadius: 3, background: RED, color: "#fff", fontFamily: FONT_STACK, flexShrink: 0 }}>PRIMARY</span>
+                        ) : (
+                          <button onClick={() => onSetPrimary(i)} style={{ fontSize: 9, fontWeight: 600, padding: "2px 8px", borderRadius: 3, background: "none", color: "#9ca3af", border: "1px solid #e5e7eb", cursor: "pointer", fontFamily: FONT_STACK, flexShrink: 0 }}>
+                            Set Primary
+                          </button>
+                        )}
+                        <button onClick={() => onRemoveFile(i)} style={{ background: "none", border: "none", cursor: "pointer", color: "#9ca3af", fontSize: 16, lineHeight: 1, padding: "0 2px", flexShrink: 0 }}>×</button>
+                      </div>
+                    );
+                  })}
+                  {files.length > 1 && (
+                    <p style={{ fontSize: 11, color: "#6b7280", margin: "6px 0 0", fontFamily: FONT_STACK }}>Cross-document conflict detection enabled</p>
+                  )}
+                </div>
               )}
             </div>
-          )}
-        </div>
 
-        {/* Staged file list */}
-        {files.length > 0 && !loading && (
-          <div style={{ marginTop: 10 }}>
-            {files.map((f, i) => (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "#fff", border: "1px solid #e5e7eb", borderRadius: 7, padding: "8px 12px", marginBottom: 5 }}>
-                <span style={{ fontSize: 14 }}>📄</span>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <p style={{ margin: 0, fontSize: 13, fontWeight: 600, color: NAVY, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</p>
-                  <p style={{ margin: 0, fontSize: 11, color: "#9ca3af" }}>{formatBytes(f.size)}</p>
+            {/* Right: Investment Criteria */}
+            <div>
+              <p style={{ margin: "0 0 12px" }}>
+                <span style={{ ...sectionLabel }}>INVESTMENT CRITERIA</span>
+                <span style={{ fontSize: 10, fontWeight: 400, color: "#9ca3af", fontFamily: FONT_STACK, marginLeft: 6, textTransform: "none" as const, letterSpacing: 0 }}>(optional)</span>
+              </p>
+
+              <div style={{ marginBottom: 16 }}>
+                <label style={{ display: "block", marginBottom: 8, fontSize: 10, fontWeight: 700, color: "#6b7280", textTransform: "uppercase" as const, letterSpacing: "1px", fontFamily: FONT_STACK }}>Strategy Focus</label>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  {([
+                    { value: "Private Equity", desc: "Buyout returns, EBITDA growth, exit multiples" },
+                    { value: "Private Credit", desc: "Debt coverage, covenant protection, downside risk" },
+                    { value: "Venture Capital", desc: "Growth rate, TAM, founder quality, burn rate" },
+                    { value: "Real Estate", desc: "NOI, cap rates, occupancy, debt service" },
+                  ] as { value: string; desc: string }[]).map(opt => {
+                    const selected = sector === opt.value;
+                    return (
+                      <button
+                        key={opt.value}
+                        onClick={() => onSectorChange(opt.value)}
+                        style={{
+                          textAlign: "left", padding: "10px 12px", borderRadius: 6, cursor: "pointer",
+                          border: `1.5px solid ${selected ? RED : "#e5e7eb"}`,
+                          background: selected ? "#fdf5f5" : "#fff",
+                          transition: "all 0.12s",
+                        }}
+                      >
+                        <div style={{ fontSize: 11, fontWeight: 700, color: selected ? RED : NAVY, fontFamily: FONT_STACK, marginBottom: 2 }}>{opt.value}</div>
+                        <div style={{ fontSize: 10, color: "#6b7280", fontFamily: FONT_STACK, lineHeight: 1.4 }}>{opt.desc}</div>
+                      </button>
+                    );
+                  })}
                 </div>
-                <span style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.5px", padding: "2px 8px", borderRadius: 20, background: i === 0 ? RED : "#f5f5f5", color: i === 0 ? "#fff" : "#6b7280" }}>
-                  {i === 0 ? "Primary CIM" : "Supporting Doc"}
-                </span>
-                <button onClick={() => onRemoveFile(i)} style={{ background: "none", border: "none", cursor: "pointer", color: "#9ca3af", fontSize: 16, lineHeight: 1, padding: "0 2px" }}>×</button>
               </div>
-            ))}
-            {files.length > 1 && (
-              <p style={{ fontSize: 11, color: "#6b7280", margin: "5px 0 0", textAlign: "center" }}>Cross-document conflict detection enabled</p>
-            )}
-          </div>
-        )}
 
-        {/* Strategy selector */}
-        <div style={{ marginTop: 16 }}>
-          <label style={{ display: "block", marginBottom: 5, ...sectionLabel }}>Strategy Focus</label>
-          <select
-            value={sector}
-            onChange={e => onSectorChange(e.target.value)}
-            style={{ ...inputStyle, boxShadow: "0 1px 4px rgba(0,0,0,0.06)", appearance: "none" }}
-          >
-            <option>Private Equity</option>
-            <option>Private Credit</option>
-            <option>Venture Capital</option>
-            <option>Real Estate</option>
-          </select>
-        </div>
-
-        {/* Investment Criteria (collapsible) */}
-        <div style={{ marginTop: 12, background: "#fff", border: "1px solid #e5e7eb", borderRadius: 7, overflow: "hidden" }}>
-          <div
-            onClick={() => setCriteriaOpen(o => !o)}
-            style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 14px", cursor: "pointer", userSelect: "none" }}
-          >
-            <span style={{ fontSize: 12, color: "#6b7280", fontFamily: "'Inter', sans-serif" }}>⚙ Customize investment criteria <span style={{ color: "#9ca3af" }}>(optional)</span></span>
-            <span style={{ fontSize: 9, color: "#9ca3af" }}>{criteriaOpen ? "▲" : "▼"}</span>
-          </div>
-          {criteriaOpen && (
-            <div style={{ padding: "4px 14px 14px", borderTop: "1px solid #f3f4f6", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px 12px" }}>
-              {[
-                { label: "Minimum EBITDA", key: "minEbitda", placeholder: "$10M" },
-                { label: "Deal size range", key: "dealSizeRange", placeholder: "$50M — $250M" },
-                { label: "Target sectors", key: "targetSectors", placeholder: "Healthcare, Technology" },
-                { label: "Geography", key: "geography", placeholder: "North America" },
-              ].map(field => (
-                <div key={field.key}>
-                  <label style={{ display: "block", marginBottom: 4, fontSize: 10, fontWeight: 600, color: "#6b7280", textTransform: "uppercase", letterSpacing: "0.5px" }}>
-                    {field.label}
-                  </label>
-                  <input
-                    type="text"
-                    placeholder={field.placeholder}
-                    value={criteria[field.key as keyof InvestmentCriteria]}
-                    onChange={e => onCriteriaChange({ ...criteria, [field.key]: e.target.value })}
-                    style={{ ...inputStyle, fontSize: 12, padding: "7px 10px" }}
-                  />
-                </div>
-              ))}
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px 12px" }}>
+                {[
+                  { label: "Min EBITDA", key: "minEbitda", placeholder: "$10M" },
+                  { label: "Deal Size", key: "dealSizeRange", placeholder: "$50M – $250M" },
+                  { label: "Target Sectors", key: "targetSectors", placeholder: "Healthcare, Tech" },
+                  { label: "Geography", key: "geography", placeholder: "North America" },
+                ].map(field => (
+                  <div key={field.key}>
+                    <label style={{ display: "block", marginBottom: 4, fontSize: 10, fontWeight: 600, color: "#6b7280", textTransform: "uppercase" as const, letterSpacing: "0.5px", fontFamily: FONT_STACK }}>
+                      {field.label}
+                    </label>
+                    <input
+                      type="text"
+                      placeholder={field.placeholder}
+                      value={criteria[field.key as keyof InvestmentCriteria]}
+                      onChange={e => onCriteriaChange({ ...criteria, [field.key]: e.target.value })}
+                      style={{ ...inputStyle, fontSize: 12, padding: "7px 10px" }}
+                    />
+                  </div>
+                ))}
+              </div>
             </div>
-          )}
+          </div>
+
+          {/* Analyze button */}
+          <div style={{ marginTop: 28 }}>
+            <button
+              onClick={onAnalyze}
+              disabled={files.length === 0}
+              style={{ width: "100%", background: files.length === 0 ? "#d1d5db" : RED, color: "#fff", border: "none", borderRadius: 6, padding: "14px 24px", fontSize: 14, fontWeight: 700, cursor: files.length === 0 ? "not-allowed" : "pointer", fontFamily: FONT_STACK, transition: "background 0.15s" }}
+            >
+              {files.length === 0 ? "Add documents to begin" : "Analyze Deal"}
+            </button>
+          </div>
+
+          {error && <p style={{ textAlign: "center", color: "#991b1b", marginTop: 12, fontSize: 13, fontFamily: FONT_STACK }}>{error}</p>}
+          <p style={{ textAlign: "center", color: "#9ca3af", fontSize: 11, marginTop: 12, fontFamily: FONT_STACK }}>
+            Documents are processed in real time and not stored.
+          </p>
         </div>
-
-        {/* Analyze button */}
-        {files.length > 0 && !loading && (
-          <button
-            onClick={onAnalyze}
-            style={{ width: "100%", marginTop: 14, background: RED, color: "#fff", border: "none", borderRadius: 7, padding: "13px 24px", fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "'Inter', sans-serif" }}
-          >
-            Analyze {files.length} document{files.length > 1 ? "s" : ""}
-          </button>
-        )}
-
-        {error && <p style={{ textAlign: "center", color: "#991b1b", marginTop: 14, fontSize: 13 }}>{error}</p>}
-        <p style={{ textAlign: "center", color: "#9ca3af", fontSize: 11, marginTop: 14 }}>
-          Documents are processed in real time and not stored.
-        </p>
-      </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -566,7 +592,7 @@ function UploadZone({
 function VerdictBadge({ verdict }: { verdict: string }) {
   const cfg = verdictConfig[verdict] ?? verdictConfig.unverifiable;
   return (
-    <span style={{ background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.border}`, borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700, whiteSpace: "nowrap", fontFamily: "'Inter', sans-serif" }}>
+    <span style={{ background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.border}`, borderRadius: 20, padding: "2px 10px", fontSize: 11, fontWeight: 700, whiteSpace: "nowrap", fontFamily: FONT_STACK }}>
       {cfg.label}
     </span>
   );
@@ -580,68 +606,197 @@ function ClaimCard({ claim, index, isActive, onClick }: { claim: Claim; index: n
   return (
     <div
       onClick={onClick}
-      style={{ border: `1px solid ${isActive ? cfg.color : "#f0ede8"}`, borderLeft: `3px solid ${cfg.color}`, borderRadius: 7, padding: isActive ? "13px" : "9px 13px", marginBottom: 6, background: isActive ? cfg.bg : "#fff", cursor: "pointer", transition: "all 0.15s" }}
+      style={{
+        borderBottom: '1px solid #e5e7eb', padding: isActive ? '12px 16px' : '10px 16px',
+        background: isActive ? '#fafafa' : '#fff', cursor: 'pointer', transition: 'background 0.1s',
+        borderLeft: `2px solid ${isActive ? cfg.color : 'transparent'}`,
+      }}
     >
-      <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
-        <p style={{
-          flex: 1, margin: 0, fontSize: 12, color: "#374151", lineHeight: 1.5, fontStyle: "italic", fontFamily: "'Inter', sans-serif",
-          ...(isActive ? {} : { display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" } as React.CSSProperties),
-        }}>
-          "{claim.claim}"
-        </p>
-        <VerdictBadge verdict={claim.verdict} />
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+        <span style={{ fontSize: 10, fontWeight: 700, color: cfg.color, fontFamily: FONT_STACK, textTransform: 'uppercase' as const, letterSpacing: '0.5px' }}>
+          {cfg.label}
+        </span>
+        {claim.page && (
+          <span style={{ fontSize: 10, color: '#9ca3af', background: '#f5f5f5', borderRadius: 3, padding: '1px 5px', fontFamily: FONT_STACK }}>
+            p.{claim.page}
+          </span>
+        )}
+        {claim.materiality === 'high' && (
+          <span style={{ fontSize: 9, fontWeight: 700, color: RED, textTransform: 'uppercase' as const, letterSpacing: '0.5px', fontFamily: FONT_STACK }}>HIGH IMPACT</span>
+        )}
       </div>
+      <p style={{
+        margin: '0 0 4px', fontSize: 13, color: '#374151', lineHeight: 1.5, fontFamily: FONT_STACK, fontWeight: 500,
+        ...(isActive ? {} : { display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' } as React.CSSProperties),
+      }}>
+        {claim.claim}
+      </p>
 
       {isActive && (
-        <div style={{ marginTop: 12 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
-            <span style={{ background: "#f5f5f5", color: "#6b7280", borderRadius: 4, padding: "1px 6px", fontSize: 10, fontWeight: 600 }}>p.{claim.page}</span>
-            <span style={{ background: "#f5f5f5", color: "#6b7280", borderRadius: 4, padding: "1px 6px", fontSize: 10 }}>{claim.category}</span>
-            {claim.materiality === "high" && (
-              <span style={{ background: RED, color: "#fff", borderRadius: 4, padding: "1px 6px", fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: "0.5px" }}>
-                High Impact
-              </span>
-            )}
-          </div>
-
+        <div style={{ marginTop: 8 }}>
+          {claim.why_it_matters && (
+            <p style={{ margin: '0 0 8px', fontSize: 12, color: '#6b7280', lineHeight: 1.5, fontFamily: FONT_STACK }}>{claim.why_it_matters}</p>
+          )}
+          {claim.explanation && (
+            <p style={{ margin: '0 0 8px', fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: FONT_STACK }}>{claim.explanation}</p>
+          )}
           {claim.diligence_question && (
-            <div style={{ background: "#fef9f0", border: "1px solid #fde68a", borderRadius: 6, padding: "9px 12px", marginBottom: 10 }}>
-              <span style={{ fontSize: 10, fontWeight: 700, color: "#92400e", textTransform: "uppercase", letterSpacing: "0.5px" }}>❓ Ask management</span>
-              <p style={{ margin: "4px 0 0", fontSize: 12, color: "#374151", lineHeight: 1.5 }}>{claim.diligence_question}</p>
+            <div style={{ borderLeft: '2px solid #e5e7eb', paddingLeft: 10, marginBottom: 8 }}>
+              <p style={{ margin: '0 0 2px', fontSize: 10, fontWeight: 700, color: '#9ca3af', textTransform: 'uppercase' as const, letterSpacing: '0.5px', fontFamily: FONT_STACK }}>Diligence question</p>
+              <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: FONT_STACK }}>{claim.diligence_question}</p>
             </div>
           )}
-
-          <p style={{ color: "#4b5563", fontSize: 12, margin: "0 0 10px", lineHeight: 1.6 }}>{claim.explanation}</p>
-
-          <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 10 }}>
-            <span style={{ fontSize: 10, color: "#9ca3af" }}>Confidence:</span>
-            {[1, 2, 3, 4, 5].map(i => (
-              <div key={i} style={{ width: 7, height: 7, borderRadius: "50%", background: i <= claim.confidence ? cfg.color : "#e5e7eb" }} />
-            ))}
-            <span style={{ fontSize: 10, color: "#9ca3af" }}>{claim.confidence}/5</span>
-          </div>
-
           {claim.sources?.filter(s => s.url).length > 0 && (
-            <div style={{ marginBottom: 10 }}>
-              <span style={{ fontSize: 10, color: "#6b7280", fontWeight: 600, marginRight: 6 }}>Sources:</span>
+            <div style={{ marginBottom: 8, display: 'flex', gap: 6, flexWrap: 'wrap' }}>
               {claim.sources.filter(s => s.url).map((s, i) => (
                 <a key={i} href={s.url} target="_blank" rel="noreferrer" onClick={e => e.stopPropagation()}
-                  style={{ display: "inline-block", background: "#f5f5f5", color: "#374151", border: "1px solid #e5e7eb", borderRadius: 20, padding: "1px 9px", fontSize: 10, textDecoration: "none", marginRight: 5, marginBottom: 4 }}>
-                  {(s.title || "Source").slice(0, 32)}{(s.title || "").length > 32 ? "…" : ""} ↗
+                  style={{ fontSize: 10, color: RED, textDecoration: 'none', fontFamily: FONT_STACK }}>
+                  {(s.title || 'Source').slice(0, 32)}{(s.title || '').length > 32 ? '…' : ''} ↗
                 </a>
               ))}
             </div>
           )}
-
           <textarea
             placeholder="Add analyst note..."
             value={note}
             onChange={e => { e.stopPropagation(); setNote(e.target.value); }}
             onClick={e => e.stopPropagation()}
-            style={{ width: "100%", border: "1px solid #e5e7eb", borderRadius: 6, padding: "6px 10px", fontSize: 11, color: "#374151", resize: "vertical", minHeight: 44, boxSizing: "border-box", fontFamily: "'Inter', sans-serif", background: "#fafafa" }}
+            style={{ width: '100%', border: '1px solid #e5e7eb', borderRadius: 4, padding: '6px 10px', fontSize: 11, color: '#374151', resize: 'vertical', minHeight: 44, boxSizing: 'border-box', fontFamily: FONT_STACK, background: '#fafafa', marginTop: 4 }}
           />
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Excel Viewer ─────────────────────────────────────────────
+function ExcelViewer({ url, requestedSheet }: { url: string; requestedSheet?: string | null }) {
+  const [sheets, setSheets] = useState<{ name: string; rows: any[][] }[]>([]);
+  const [activeSheet, setActiveSheet] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+
+  // Jump to a sheet by name when requested externally
+  useEffect(() => {
+    if (!requestedSheet || sheets.length === 0) return;
+    const idx = sheets.findIndex(s =>
+      s.name.toLowerCase() === requestedSheet.toLowerCase()
+    );
+    if (idx !== -1) setActiveSheet(idx);
+  }, [requestedSheet, sheets]);
+
+  useEffect(() => {
+    setLoading(true);
+    setError(false);
+    fetch(url)
+      .then(r => r.arrayBuffer())
+      .then(buf => {
+        const wb = XLSX.read(buf, { type: 'array' });
+        const parsed = wb.SheetNames.map(name => {
+          const ws = wb.Sheets[name];
+          const rows: any[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+          // trim trailing empty rows
+          while (rows.length && rows[rows.length - 1].every((c: any) => c === '')) rows.pop();
+          return { name, rows };
+        }).filter(s => s.rows.length > 0);
+        setSheets(parsed);
+        setActiveSheet(0);
+      })
+      .catch(() => setError(true))
+      .finally(() => setLoading(false));
+  }, [url]);
+
+  if (loading) return (
+    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f8f9fa' }}>
+      <span style={{ fontSize: 12, color: '#9ca3af', fontFamily: FONT_STACK }}>Loading spreadsheet…</span>
+    </div>
+  );
+
+  if (error || sheets.length === 0) return (
+    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f8f9fa' }}>
+      <span style={{ fontSize: 12, color: '#9ca3af', fontFamily: FONT_STACK }}>Could not render this spreadsheet.</span>
+    </div>
+  );
+
+  const { rows } = sheets[activeSheet];
+  // Detect header row: first non-empty row
+  const headerRow = rows[0] ?? [];
+  const dataRows = rows.slice(1);
+
+  return (
+    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: '#f8f9fa' }}>
+      {/* Sheet tabs */}
+      <div style={{ flexShrink: 0, display: 'flex', background: '#fff', borderBottom: '1px solid #e5e7eb', overflowX: 'auto', padding: '0 8px' }}>
+        {sheets.map((s, i) => (
+          <button key={i} onClick={() => setActiveSheet(i)} style={{
+            padding: '7px 14px', fontSize: 11, fontWeight: 600, fontFamily: FONT_STACK,
+            color: activeSheet === i ? RED : '#6b7280',
+            borderBottom: activeSheet === i ? `2px solid ${RED}` : '2px solid transparent',
+            background: 'none', border: 'none', borderRadius: 0,
+            cursor: 'pointer', whiteSpace: 'nowrap', transition: 'color 0.1s',
+          }}>
+            {s.name}
+          </button>
+        ))}
+      </div>
+
+      {/* Table */}
+      <div style={{ flex: 1, overflow: 'auto' }}>
+        <table style={{ borderCollapse: 'collapse', fontSize: 11, fontFamily: FONT_STACK, width: '100%', minWidth: 'max-content' }}>
+          {/* Header row */}
+          {headerRow.some((c: any) => c !== '') && (
+            <thead>
+              <tr>
+                {headerRow.map((cell: any, ci: number) => (
+                  <th key={ci} style={{
+                    position: 'sticky', top: 0, zIndex: 2,
+                    background: NAVY, color: '#fff',
+                    padding: '6px 12px', textAlign: 'left',
+                    fontWeight: 700, fontSize: 10, letterSpacing: '0.3px',
+                    borderRight: '1px solid rgba(255,255,255,0.1)',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {cell !== '' ? String(cell) : ''}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+          )}
+          <tbody>
+            {dataRows.map((row, ri) => {
+              const isEmpty = row.every((c: any) => c === '');
+              if (isEmpty) return (
+                <tr key={ri}><td colSpan={headerRow.length} style={{ height: 8 }} /></tr>
+              );
+              // Section header: first cell has content, rest are empty
+              const isSectionHeader = row[0] !== '' && row.slice(1).every((c: any) => c === '');
+              return (
+                <tr key={ri} style={{ background: ri % 2 === 0 ? '#fff' : '#f9fafb' }}>
+                  {row.map((cell: any, ci: number) => {
+                    const val = cell === '' ? '' : String(cell);
+                    const isFirstCol = ci === 0;
+                    return (
+                      <td key={ci} style={{
+                        padding: '5px 12px',
+                        borderBottom: '1px solid #f0f0f0',
+                        borderRight: '1px solid #f0f0f0',
+                        color: isSectionHeader && isFirstCol ? RED
+                          : isFirstCol ? NAVY : '#374151',
+                        fontWeight: isSectionHeader ? 700 : isFirstCol ? 500 : 400,
+                        fontSize: 11,
+                        whiteSpace: 'nowrap',
+                        background: isSectionHeader ? '#fdf5f5' : undefined,
+                      }}>
+                        {val}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -808,59 +963,318 @@ function PDFViewer({ file, claims, activePage, currentPage, onPageChange, onNumP
 }
 
 // ── Export IC Brief ──────────────────────────────────────────
-function buildICBrief(assessment: Assessment, claims: Claim[], conflicts: CrossDocumentConflict[], filename: string): string {
+function buildICBrief(
+  assessment: Assessment,
+  claims: Claim[],
+  conflicts: CrossDocumentConflict[],
+  filename: string,
+  compsData?: CompsData | null,
+  dealName?: string,
+  chartsData?: any,
+): string {
   const today = new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
-  const escHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-  const sec = (label: string, content: string) =>
-    `<div class="s"><div class="sl">${label}</div>${content}</div>`;
+  // Strip [[Page X, Doc]] and [[Slide X]] citation tags — they must never appear in print
+  const strip = (s: string | null | undefined): string => {
+    if (!s) return '';
+    return s
+      .replace(/\[\[Page \d+,?\s*[^\]]*\]\]/g, '')
+      .replace(/\[\[Slide \d+\]\]/g, '')
+      .trim();
+  };
 
-  const ol = (items: string[]) =>
-    `<ol>${items.map(i => `<li>${escHtml(i)}</li>`).join("")}</ol>`;
+  // Strip citations then HTML-escape — safe to insert as element text content
+  const esc = (s: string | null | undefined): string => {
+    const t = strip(s);
+    return t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  };
 
-  const conflictTable = conflicts.length === 0 ? "" : sec("Cross-Document Conflicts",
-    `<table><thead><tr><th>Doc 1</th><th>Doc 2</th><th>Severity</th><th>Explanation</th></tr></thead><tbody>
-    ${conflicts.map(c => `<tr><td>${escHtml(c.doc1)}</td><td>${escHtml(c.doc2)}</td><td>${c.severity}</td><td>${escHtml(c.explanation)}</td></tr>`).join("")}
-    </tbody></table>`
-  );
-
-  const diligenceItems = claims.filter(c => c.diligence_question).map(c => c.diligence_question);
+  const dealTitle = dealName || filename.replace(/\.[^.]+$/, '');
+  const sector = compsData?.deal_profile?.sector || '';
   const holds = assessment.narrative_holds_up;
+  const dealScore: number = chartsData?.deal_scorecard?.overall_score ?? 0;
 
-  return `
+  const verdictColor = assessment.overall_verdict === 'Worth deeper look' ? '#166534'
+    : assessment.overall_verdict === 'Borderline' ? '#92400e'
+    : '#991b1b';
+
+  // Deal metrics from compsData
+  const dp = compsData?.deal_profile;
+  const metricRows = [
+    dp?.revenue_millions   ? `<tr><td>Revenue</td><td>$${dp.revenue_millions}M</td></tr>` : '',
+    dp?.ebitda_millions    ? `<tr><td>EBITDA</td><td>$${dp.ebitda_millions}M</td></tr>` : '',
+    dp?.ebitda_margin_pct  ? `<tr><td>EBITDA Margin</td><td>${dp.ebitda_margin_pct}%</td></tr>` : '',
+    dp?.geography          ? `<tr><td>Geography</td><td>${esc(dp.geography)}</td></tr>` : '',
+    dp?.sub_sector         ? `<tr><td>Sub-sector</td><td>${esc(dp.sub_sector)}</td></tr>` : '',
+  ].filter(Boolean).join('');
+
+  // Comps table rows
+  const fmtEV  = (v: number | null | undefined) =>
+    v == null ? '—' : v >= 1000 ? `$${(v / 1000).toFixed(1)}B` : `$${v.toFixed(0)}M`;
+  const fmtX   = (v: number | null | undefined) => v == null ? '—' : `${v.toFixed(1)}x`;
+
+  const compsRows = (compsData?.comps ?? []).map(c =>
+    `<tr>
+      <td>${esc(c.company)}</td><td>${esc(c.acquirer)}</td><td>${esc(c.date)}</td>
+      <td class="nr">${fmtEV(c.ev_millions)}</td>
+      <td class="nr">${fmtX(c.ev_ebitda)}</td>
+      <td class="nr">${fmtX(c.ev_revenue)}</td>
+      <td style="max-width:120px">${esc(c.why_comparable)}</td>
+    </tr>`
+  ).join('');
+
+  const sectorRow = (compsData?.sector_context?.typical_ev_ebitda_low && compsData?.sector_context?.typical_ev_ebitda_high)
+    ? `<tr class="sub"><td colspan="4" style="color:#6b7280">Sector range</td>
+        <td class="nr" style="color:#6b7280">${compsData.sector_context.typical_ev_ebitda_low.toFixed(1)}x – ${compsData.sector_context.typical_ev_ebitda_high.toFixed(1)}x</td>
+        <td colspan="2"></td></tr>`
+    : '';
+
+  const thisDealRow = compsData?.this_deal_positioning?.implied_ev_ebitda
+    ? `<tr class="this-deal">
+        <td colspan="4">This Deal (Implied)</td>
+        <td class="nr">${fmtX(compsData.this_deal_positioning.implied_ev_ebitda)}</td>
+        <td class="nr">${fmtX(compsData.this_deal_positioning.implied_ev_revenue)}</td>
+        <td style="font-style:italic">${esc(compsData.this_deal_positioning?.vs_comp_set)}</td>
+      </tr>`
+    : '';
+
+  const diligenceClaims = claims.filter(c => c.diligence_question);
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>IC Brief — ${esc(dealTitle)}</title>
 <style>
   @media print {
-    body > *:not(#ic-brief-print) { display: none !important; }
-    #ic-brief-print { display: block !important; }
+    @page { margin: 0.75in; size: letter; }
+    * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+    .page-break { page-break-before: always; }
+    table { page-break-inside: avoid; }
+    h2, h3 { page-break-after: avoid; }
   }
-  #ic-brief-print {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 760px; margin: 0 auto; padding: 40px; color: #1a1a1a;
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Open Sans', Arial, sans-serif;
+    color: #1a1a1a; font-size: 11px; line-height: 1.55; background: #fff;
   }
-  #ic-brief-print .hdr h1 { font-size: 20px; font-weight: 800; margin: 0 0 4px; letter-spacing: -0.3px; }
-  #ic-brief-print .hdr .meta { font-size: 11px; color: #666; }
-  #ic-brief-print hr { border: none; border-top: 1px solid #ccc; margin: 16px 0; }
-  #ic-brief-print .s { margin-bottom: 20px; }
-  #ic-brief-print .sl { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; border-bottom: 1px solid #ccc; padding-bottom: 4px; margin-bottom: 8px; color: #333; }
-  #ic-brief-print p { font-size: 11px; line-height: 1.6; margin: 0 0 5px; }
-  #ic-brief-print ol { margin: 0; padding-left: 20px; }
-  #ic-brief-print li { font-size: 11px; line-height: 1.6; margin-bottom: 4px; }
-  #ic-brief-print .verdict { font-size: 18px; font-weight: 800; margin: 0 0 6px; letter-spacing: -0.3px; }
-  #ic-brief-print table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 6px; }
-  #ic-brief-print th { text-align: left; font-size: 10px; font-weight: 700; text-transform: uppercase; border-bottom: 1px solid #ccc; padding: 4px 8px; }
-  #ic-brief-print td { padding: 5px 8px; border-bottom: 1px solid #eee; vertical-align: top; }
-  #ic-brief-print .footer { font-size: 9px; color: #999; text-align: center; margin-top: 32px; border-top: 1px solid #eee; padding-top: 10px; }
+  .page {
+    max-width: 7.5in; margin: 0 auto; padding: 0.55in 0.6in;
+    min-height: 9.5in; display: flex; flex-direction: column;
+  }
+  /* Header */
+  .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
+  .wordmark { font-size: 20px; font-weight: 800; color: #913d3e; letter-spacing: 4px; line-height: 1; }
+  .doc-subtype { font-size: 8px; font-weight: 700; letter-spacing: 2.5px; text-transform: uppercase; color: #6b7280; margin-top: 4px; }
+  .header-meta { text-align: right; font-size: 10px; color: #6b7280; line-height: 1.7; }
+  .header-meta .deal-name { font-size: 13px; font-weight: 700; color: #1a1a1a; display: block; margin-bottom: 2px; }
+  /* Rules */
+  .rule { border: none; border-top: 2px solid #1a1a1a; margin: 10px 0 12px; }
+  .rule-light { border: none; border-top: 1px solid #e5e7eb; margin: 9px 0; }
+  /* Labels */
+  .lbl { font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: 2px; color: #913d3e; display: block; margin-bottom: 5px; }
+  /* Verdict */
+  .verdict-text { font-size: 22px; font-weight: 800; letter-spacing: -0.3px; line-height: 1.1; margin: 3px 0 5px; color: ${verdictColor}; }
+  .verdict-reasoning { font-size: 11.5px; color: #374151; line-height: 1.55; margin-bottom: 4px; }
+  /* Two-column layout using table */
+  .two-col { display: table; width: 100%; table-layout: fixed; }
+  .col { display: table-cell; vertical-align: top; }
+  .col-div { display: table-cell; width: 1px; background: #e5e7eb; }
+  /* Metrics */
+  table.metrics { width: 100%; border-collapse: collapse; }
+  table.metrics td { padding: 3px 0; font-size: 10.5px; border-bottom: 1px solid #f3f4f6; }
+  table.metrics td:first-child { color: #6b7280; }
+  table.metrics td:last-child { text-align: right; font-weight: 600; }
+  /* Narrative */
+  .narrative-box { border-left: 3px solid #d1d5db; padding: 7px 12px; margin: 5px 0 10px; background: #fafafa; }
+  .narrative-text { font-size: 11px; color: #374151; line-height: 1.6; font-style: italic; }
+  .narrative-verdict { font-size: 10px; font-weight: 700; margin-top: 5px; }
+  /* Risks / Bull */
+  .item-row { display: flex; gap: 6px; margin-bottom: 5px; padding-bottom: 5px; border-bottom: 1px solid #f3f4f6; font-size: 11px; line-height: 1.5; }
+  .item-row:last-child { border-bottom: none; margin-bottom: 0; }
+  .item-row .n { font-weight: 700; flex-shrink: 0; min-width: 16px; }
+  /* Data table */
+  table.dt { width: 100%; border-collapse: collapse; font-size: 10px; margin-top: 5px; }
+  table.dt th { text-align: left; font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #6b7280; border-bottom: 2px solid #1a1a1a; padding: 4px 5px; white-space: nowrap; }
+  table.dt th.nr { text-align: right; }
+  table.dt td { padding: 5px 5px; border-bottom: 1px solid #eee; vertical-align: top; }
+  table.dt td.nr { text-align: right; font-weight: 600; }
+  table.dt tr.sub td { background: #f9fafb; }
+  table.dt tr.this-deal td { border-top: 2px solid #1a1a1a; }
+  /* Conflicts */
+  .conflict { margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #e5e7eb; }
+  .conflict:last-child { border-bottom: none; }
+  .conflict-sev { font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
+  .sev-high { color: #dc2626; } .sev-medium { color: #92400e; } .sev-low { color: #6b7280; }
+  .conflict-claims { display: table; width: 100%; table-layout: fixed; margin: 5px 0; }
+  .conflict-side { display: table-cell; vertical-align: top; padding-right: 12px; }
+  .conflict-side:last-child { padding-right: 0; }
+  .side-label { font-size: 7.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: #9ca3af; margin-bottom: 2px; }
+  .side-text { font-size: 10.5px; color: #374151; font-style: italic; line-height: 1.5; }
+  .conflict-expl { font-size: 10.5px; color: #374151; line-height: 1.5; border-top: 1px solid #f0f0f0; padding-top: 4px; margin-top: 4px; }
+  /* Checklist */
+  .chk { display: flex; gap: 8px; margin-bottom: 5px; font-size: 11px; line-height: 1.5; }
+  .chk .box { flex-shrink: 0; font-size: 12px; line-height: 1.1; }
+  /* Footer */
+  .footer { margin-top: auto; padding-top: 12px; border-top: 1px solid #e5e7eb; display: flex; justify-content: space-between; font-size: 8.5px; color: #9ca3af; }
+  /* Spacing */
+  .sec { margin-bottom: 13px; }
+  p { margin: 0 0 5px; }
 </style>
-<div class="hdr"><h1>SAGARD — Investment Committee Brief</h1><p class="meta">${today} · ${escHtml(filename)}</p></div>
-<hr />
-${sec("Company", `<p>${escHtml(assessment.company_snapshot || "—")}</p>`)}
-${sec("Seller Narrative", `<p>${escHtml(assessment.sellers_narrative || "—")}${holds ? ` — <em>${holds.holds ? "Holds up" : "Does not hold up"}: ${escHtml(holds.explanation)}</em>` : ""}</p>`)}
-${sec("First-Pass Verdict", `<p class="verdict">${escHtml(assessment.overall_verdict)}</p><p>${escHtml(assessment.reasoning)}</p>${assessment.criteria_fit ? `<p><strong>Criteria fit:</strong> ${assessment.criteria_fit.fits ? "✓" : "✗"} ${escHtml(assessment.criteria_fit.explanation)}</p>` : ""}`)}
-${sec("Must Answer Before Proceeding", ol(assessment.key_questions || []))}
-${sec("Key Risks", ol(assessment.top_risks || []))}
-${sec("Bull Case", `<p>${escHtml(assessment.bull_case || "—")}</p>`)}
-${conflictTable}
-${sec("Diligence Checklist", ol(diligenceItems))}
-<div class="footer">Generated by Sagard CIM Analyzer — AI-assisted analysis. Human judgment required for all investment decisions.</div>`;
+</head>
+<body>
+
+<!-- ═══ PAGE 1 ═══ -->
+<div class="page">
+
+  <div class="doc-header">
+    <div>
+      <div class="wordmark">SAGARD</div>
+      <div class="doc-subtype">Investment Committee Brief</div>
+    </div>
+    <div class="header-meta">
+      <span class="deal-name">${esc(dealTitle)}</span>
+      ${sector ? `<span>${esc(sector)}</span><br>` : ''}
+      <span>${today}</span>
+    </div>
+  </div>
+  <hr class="rule">
+
+  <!-- Verdict -->
+  <div class="sec">
+    <span class="lbl">First-Pass Verdict</span>
+    <div class="verdict-text">${esc(assessment.overall_verdict)}</div>
+    <div class="verdict-reasoning">${esc(assessment.reasoning)}</div>
+    ${dealScore > 0 ? `<div style="font-size:10px;color:#6b7280;margin-bottom:3px">Deal Score: ${dealScore} / 10</div>` : ''}
+    ${assessment.criteria_fit
+      ? `<div style="font-size:10px;color:${assessment.criteria_fit.fits ? '#166534' : '#991b1b'}">${assessment.criteria_fit.fits ? '✓ Fits' : '✗ Outside'} investment criteria — ${esc(assessment.criteria_fit.explanation)}</div>`
+      : ''}
+  </div>
+  <hr class="rule-light">
+
+  <!-- Company + Metrics -->
+  <div class="sec">
+    <div class="two-col">
+      <div class="col" style="width:57%;padding-right:18px">
+        <span class="lbl">Company</span>
+        <p style="font-size:11px;color:#374151;line-height:1.65">${esc(assessment.company_snapshot)}</p>
+      </div>
+      <div class="col-div"></div>
+      <div class="col" style="width:41%;padding-left:18px">
+        <span class="lbl">Deal Metrics</span>
+        ${metricRows
+          ? `<table class="metrics">${metricRows}</table>`
+          : `<p style="color:#9ca3af;font-size:10px">Run COMPS analysis to populate metrics.</p>`}
+      </div>
+    </div>
+  </div>
+  <hr class="rule-light">
+
+  <!-- Seller Narrative -->
+  ${assessment.sellers_narrative ? `
+  <div class="sec">
+    <span class="lbl">Seller Narrative</span>
+    <div class="narrative-box">
+      <div class="narrative-text">${esc(assessment.sellers_narrative)}</div>
+      ${holds ? `<div class="narrative-verdict" style="color:${holds.holds ? '#166534' : '#991b1b'}">Narrative assessment: ${holds.holds ? 'Holds up' : 'Does not hold up'}${holds.explanation ? ` — ${esc(holds.explanation)}` : ''}</div>` : ''}
+    </div>
+  </div>` : ''}
+
+  <!-- Risks + Bull Case -->
+  ${(assessment.top_risks?.length > 0 || assessment.bull_case) ? `
+  <div class="sec">
+    <div class="two-col">
+      <div class="col" style="width:50%;padding-right:18px">
+        <span class="lbl">Key Risks</span>
+        ${(assessment.top_risks ?? []).map((r, i) => `<div class="item-row"><span class="n" style="color:#dc2626">${i + 1}.</span><span style="color:#dc2626">${esc(r)}</span></div>`).join('')}
+      </div>
+      <div class="col-div"></div>
+      <div class="col" style="width:48%;padding-left:18px">
+        <span class="lbl" style="color:#16a34a">Bull Case</span>
+        ${assessment.bull_case ? `<div class="item-row"><span style="color:#16a34a">${esc(assessment.bull_case)}</span></div>` : ''}
+      </div>
+    </div>
+  </div>` : ''}
+
+  <div class="footer">
+    <span>SAGARD CIM Analyzer — AI-assisted first-pass analysis. All investment decisions require human judgment.</span>
+    <span>Page 1 of 2 &nbsp;·&nbsp; ${today}</span>
+  </div>
+</div>
+
+<!-- ═══ PAGE 2 ═══ -->
+<div class="page page-break">
+
+  <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">
+    <div style="font-size:10px;font-weight:800;color:#913d3e;letter-spacing:3px">SAGARD</div>
+    <div style="font-size:9px;color:#6b7280">${esc(dealTitle)} — continued</div>
+  </div>
+  <hr class="rule">
+
+  <!-- Key Questions -->
+  ${assessment.key_questions?.length > 0 ? `
+  <div class="sec">
+    <span class="lbl">Key Questions for Management</span>
+    ${assessment.key_questions.map((q, i) => `<div class="item-row"><span class="n" style="color:#913d3e">${i + 1}.</span><span>${esc(q)}</span></div>`).join('')}
+  </div>` : ''}
+
+  <!-- Diligence Checklist -->
+  ${diligenceClaims.length > 0 ? `
+  <div class="sec">
+    <span class="lbl">Diligence Checklist</span>
+    ${diligenceClaims.map((c, i) => `<div class="chk"><span class="box">&#9633;</span><span style="color:#6b7280;font-weight:600;min-width:20px;flex-shrink:0">${i + 1}.</span><span>${esc(c.diligence_question)}</span></div>`).join('')}
+  </div>` : ''}
+
+  <!-- Conflicts -->
+  ${conflicts.length > 0 ? `
+  <div class="sec">
+    <span class="lbl">Cross-Document Conflicts (${conflicts.length})</span>
+    ${conflicts.map(c => `
+    <div class="conflict">
+      <div style="display:flex;gap:10px;align-items:baseline;margin-bottom:5px">
+        <span class="conflict-sev sev-${c.severity}">${c.severity.toUpperCase()}</span>
+        <span style="font-size:9px;color:#6b7280">${esc(c.doc1)} vs. ${esc(c.doc2)}</span>
+      </div>
+      <div class="conflict-claims">
+        <div class="conflict-side">
+          <div class="side-label">${esc(c.doc1)}</div>
+          <div class="side-text">"${esc(c.claim1)}"</div>
+        </div>
+        <div class="conflict-side">
+          <div class="side-label">${esc(c.doc2)}</div>
+          <div class="side-text">"${esc(c.claim2)}"</div>
+        </div>
+      </div>
+      <div class="conflict-expl">${esc(c.explanation)}</div>
+    </div>`).join('')}
+  </div>` : ''}
+
+  <!-- Comps Table -->
+  ${compsData?.comps?.length ? `
+  <div class="sec">
+    <span class="lbl">Comparable Transactions</span>
+    <table class="dt">
+      <thead><tr>
+        <th>Company</th><th>Acquirer</th><th>Date</th>
+        <th class="nr">EV</th><th class="nr">EV/EBITDA</th><th class="nr">EV/Rev</th><th>Notes</th>
+      </tr></thead>
+      <tbody>
+        ${compsRows}
+        ${sectorRow}
+        ${thisDealRow}
+      </tbody>
+    </table>
+    ${compsData.valuation_context ? `<p style="margin-top:8px;font-size:10px;color:#6b7280;line-height:1.6">${esc(compsData.valuation_context)}</p>` : ''}
+  </div>` : ''}
+
+  <div class="footer">
+    <span>SAGARD CIM Analyzer — AI-assisted first-pass analysis. All investment decisions require human judgment.</span>
+    <span>Page 2 of 2 &nbsp;·&nbsp; ${today}</span>
+  </div>
+</div>
+
+</body>
+</html>`;
 }
 
 // ── Citation formatter ───────────────────────────────────────
@@ -869,7 +1283,7 @@ function formatCitations(text: string): string {
   let f = text;
 
   // Bold and italic
-  f = f.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+  f = f.replace(/\*\*(.*?)\*\*/g, '<span style="font-weight:inherit">$1</span>');
   f = f.replace(/\*([^*]+)\*/g, '<em>$1</em>');
 
   // Headers
@@ -885,7 +1299,8 @@ function formatCitations(text: string): string {
   // Remove separator rows (|---|---|) — now rendered as <tr><td>---</td></tr>
   f = f.replace(/<tr>(<td[^>]*>[\s\-:]+<\/td>)+<\/tr>/g, '');
   // Wrap consecutive <tr> blocks in a <table>, promoting first row to header
-  f = f.replace(/(<tr>(?:<td[^>]*>.*?<\/td>)+<\/tr>\n?)+/gs, (block) => {
+  // Avoid `s` (dotAll) regex flag for older TS targets; use [\\s\\S] to match newlines.
+  f = f.replace(/(<tr>(?:<td[^>]*>[\s\S]*?<\/td>)+<\/tr>\n?)+/g, (block) => {
     const rows = block.trim().split('\n').filter(r => r.startsWith('<tr>'));
     if (rows.length === 0) return block;
     const header = rows[0]
@@ -895,6 +1310,12 @@ function formatCitations(text: string): string {
     return `<div style="overflow-x:auto;margin:8px 0;"><table style="border-collapse:collapse;width:100%;">${header}${body}</table></div>`;
   });
 
+  // Citations [[Sheet: SheetName, DocName]]
+  f = f.replace(/\[\[Sheet:\s*([^\],]+),\s*([^\]]+)\]\]/gi,
+    '<span onclick="window.jumpToSheet(\'$1\',\'$2\')" style="display:inline-block;background:#f0fdf4;color:#16a34a;border:1px solid #bbf7d0;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:600;margin:0 2px;cursor:pointer;user-select:none;" title="Jump to $1 in $2">$1↗</span>');
+  // Citations [[Sheet: SheetName]] (no doc name)
+  f = f.replace(/\[\[Sheet:\s*([^\]]+)\]\]/gi,
+    '<span onclick="window.jumpToSheet(\'$1\')" style="display:inline-block;background:#f0fdf4;color:#16a34a;border:1px solid #bbf7d0;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:600;margin:0 2px;cursor:pointer;user-select:none;" title="Jump to sheet $1">$1↗</span>');
   // Citations [[Page X, DocName]]
   f = f.replace(/\[\[Page\s+(\d+),\s*([^\]]+)\]\]/gi,
     '<span onclick="window.jumpToPage($1,\'$2\')" style="display:inline-block;background:#fef3f2;color:#913d3e;border:1px solid #fecaca;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:600;margin:0 2px;cursor:pointer;user-select:none;" title="Jump to page $1 in $2">p.$1↗</span>');
@@ -938,26 +1359,54 @@ function fixChartJson(str: string): string {
 
 function parseResponseSegments(text: string): Segment[] {
   const segments: Segment[] = [];
-  const chartRegex = /CHART:(\{(?:[^{}]|\{[^{}]*\})*\})/g;
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = chartRegex.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      const textContent = text.slice(lastIndex, match.index).trim();
-      if (textContent) segments.push({ type: 'text', content: textContent });
+  let remaining = text;
+
+  while (remaining.length > 0) {
+    const chartIndex = remaining.indexOf('CHART:');
+
+    if (chartIndex === -1) {
+      const trimmed = remaining.trim();
+      if (trimmed) segments.push({ type: 'text', content: trimmed });
+      break;
     }
+
+    // Text before the CHART: marker
+    const textBefore = remaining.substring(0, chartIndex).trim();
+    if (textBefore) segments.push({ type: 'text', content: textBefore });
+
+    // Walk forward from the opening brace, counting depth
+    const jsonStart = chartIndex + 6; // skip 'CHART:'
+    let braceCount = 0;
+    let jsonEnd = -1;
+
+    for (let i = jsonStart; i < remaining.length; i++) {
+      if (remaining[i] === '{') braceCount++;
+      else if (remaining[i] === '}') {
+        braceCount--;
+        if (braceCount === 0) { jsonEnd = i + 1; break; }
+      }
+    }
+
+    if (jsonEnd === -1) {
+      // No matching closing brace — treat the rest as text
+      segments.push({ type: 'text', content: remaining.substring(chartIndex) });
+      break;
+    }
+
+    const jsonStr = remaining.substring(jsonStart, jsonEnd);
     try {
-      segments.push({ type: 'chart', chartData: JSON.parse(fixChartJson(match[1])) });
-    } catch {
-      segments.push({ type: 'text', content: match[0] });
+      const chartData = JSON.parse(fixChartJson(jsonStr));
+      console.log('[Chart] Parsed segment type:', chartData?.type);
+      segments.push({ type: 'chart', chartData });
+    } catch (e) {
+      console.error('[Chart] JSON parse failed:', e, jsonStr.substring(0, 200));
+      segments.push({ type: 'text', content: `CHART:${jsonStr}` });
     }
-    lastIndex = match.index + match[0].length;
+
+    remaining = remaining.substring(jsonEnd).trim();
   }
-  if (lastIndex < text.length) {
-    const remaining = text.slice(lastIndex).trim();
-    if (remaining) segments.push({ type: 'text', content: remaining });
-  }
-  return segments;
+
+  return segments.length > 0 ? segments : [{ type: 'text', content: text }];
 }
 
 // recharts React 19 compat casts
@@ -994,7 +1443,7 @@ function ChartRenderer({ chartData }: { chartData: any }) {
   } catch (err) {
     console.error("ChartRenderer error:", err, chartData);
     return (
-      <div style={{ padding: 16, background: "#fef3f2", borderRadius: 8, color: RED, fontSize: 12, fontFamily: "'Inter', sans-serif" }}>
+      <div style={{ padding: 16, background: "#fef3f2", borderRadius: 8, color: RED, fontSize: 12, fontFamily: FONT_STACK }}>
         Could not render chart — data may be incomplete. Try rephrasing your request.
       </div>
     );
@@ -1020,9 +1469,9 @@ function ChartRendererInner({ chartData }: { chartData: any }) {
 
   const chartTitle = (
     <div>
-      <p style={{ fontFamily: "'Inter', sans-serif", fontSize: 14, fontWeight: 700, color: NAVY, margin: "0 0 4px", letterSpacing: "-0.3px" }}>{chartData.title}</p>
+      <p style={{ fontFamily: FONT_STACK, fontSize: 14, fontWeight: 700, color: NAVY, margin: "0 0 4px", letterSpacing: "-0.3px" }}>{chartData.title}</p>
       {chartData.description && (
-        <p style={{ fontSize: 11, color: "#6b7280", margin: "0 0 12px", fontFamily: "'Inter', sans-serif" }}>{chartData.description}</p>
+        <p style={{ fontSize: 11, color: "#6b7280", margin: "0 0 12px", fontFamily: FONT_STACK }}>{chartData.description}</p>
       )}
     </div>
   );
@@ -1199,7 +1648,7 @@ function ChartRendererInner({ chartData }: { chartData: any }) {
     default:
       return (
         <div style={{ background: "#f9fafb", borderRadius: 8, padding: 12, marginTop: 8 }}>
-          <p style={{ fontSize: 12, color: "#6b7280", fontFamily: "'Inter', sans-serif" }}>Chart type "{chartData.type}" is not yet supported.</p>
+          <p style={{ fontSize: 12, color: "#6b7280", fontFamily: FONT_STACK }}>Chart type "{chartData.type}" is not yet supported.</p>
         </div>
       );
   }
@@ -1229,7 +1678,7 @@ function ChartsSection({ chartsData }: { chartsData: any }) {
       {/* Chart 1: Margin Trend */}
       <div>
         <p style={{ ...sectionLabel, margin: "0 0 2px" }}>MARGIN TREND</p>
-        <p style={{ fontSize: 11, color: "#9ca3af", margin: "0 0 12px", fontFamily: "'Inter', sans-serif" }}>Historical performance extracted from documents</p>
+        <p style={{ fontSize: 11, color: "#9ca3af", margin: "0 0 12px", fontFamily: FONT_STACK }}>Historical performance extracted from documents</p>
         {marginData.length > 0 ? (
           <ResponsiveContainer width="100%" height={280}>
             <RC.LineChart data={marginData} margin={{ top: 5, right: 36, left: 0, bottom: 5 }}>
@@ -1244,7 +1693,7 @@ function ChartsSection({ chartsData }: { chartsData: any }) {
             </RC.LineChart>
           </ResponsiveContainer>
         ) : (
-          <p style={{ fontSize: 12, color: "#9ca3af", textAlign: "center", padding: "20px 0", fontFamily: "'Inter', sans-serif" }}>No historical financial data found in documents.</p>
+          <p style={{ fontSize: 12, color: "#9ca3af", textAlign: "center", padding: "20px 0", fontFamily: FONT_STACK }}>No historical financial data found in documents.</p>
         )}
       </div>
 
@@ -1252,17 +1701,17 @@ function ChartsSection({ chartsData }: { chartsData: any }) {
       <div style={{ borderTop: "1px solid #f0ede8", margin: "16px 0", paddingTop: 16, textAlign: "center" }}>
         <p style={{ ...sectionLabel, margin: "0 0 6px" }}>DEAL SCORE</p>
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "center", gap: 4 }}>
-          <span style={{ fontFamily: "'Inter', sans-serif", fontSize: 48, fontWeight: 800, color: scoreColor, lineHeight: 1, letterSpacing: "-1px" }}>
+          <span style={{ fontFamily: FONT_STACK, fontSize: 48, fontWeight: 700, color: scoreColor, lineHeight: 1, letterSpacing: "-1px" }}>
             {overallScore}
           </span>
-          <span style={{ fontSize: 20, color: "#9ca3af", fontFamily: "'Inter', sans-serif" }}>/10</span>
+          <span style={{ fontSize: 20, color: "#9ca3af", fontFamily: FONT_STACK }}>/10</span>
         </div>
       </div>
 
       {/* Chart 2: Deal Scorecard */}
       <div>
         <p style={{ ...sectionLabel, margin: "0 0 2px" }}>DEAL SCORECARD</p>
-        <p style={{ fontSize: 11, color: "#9ca3af", margin: "0 0 12px", fontFamily: "'Inter', sans-serif" }}>AI-scored across six dimensions</p>
+        <p style={{ fontSize: 11, color: "#9ca3af", margin: "0 0 12px", fontFamily: FONT_STACK }}>AI-scored across six dimensions</p>
         {radarData.length > 0 ? (
           <ResponsiveContainer width="100%" height={280}>
             <RC.RadarChart data={radarData}>
@@ -1273,7 +1722,7 @@ function ChartsSection({ chartsData }: { chartsData: any }) {
             </RC.RadarChart>
           </ResponsiveContainer>
         ) : (
-          <p style={{ fontSize: 12, color: "#9ca3af", textAlign: "center", padding: "20px 0", fontFamily: "'Inter', sans-serif" }}>No scorecard data available.</p>
+          <p style={{ fontSize: 12, color: "#9ca3af", textAlign: "center", padding: "20px 0", fontFamily: FONT_STACK }}>No scorecard data available.</p>
         )}
         {deal_scorecard.dimensions?.length > 0 && (
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 12 }}>
@@ -1282,8 +1731,8 @@ function ChartsSection({ chartsData }: { chartsData: any }) {
               const sColor = sc <= 4 ? "#dc2626" : sc <= 6 ? "#d97706" : "#16a34a";
               return (
                 <div key={d.name} title={d.reasoning} style={{ background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: 6, padding: "8px 10px", cursor: "default" }}>
-                  <p style={{ margin: "0 0 2px", fontSize: 11, color: "#6b7280", fontFamily: "'Inter', sans-serif" }}>{d.name}</p>
-                  <p style={{ margin: 0, fontSize: 16, fontWeight: 700, color: sColor, fontFamily: "'Inter', sans-serif", lineHeight: 1 }}>{sc}</p>
+                  <p style={{ margin: "0 0 2px", fontSize: 11, color: "#6b7280", fontFamily: FONT_STACK }}>{d.name}</p>
+                  <p style={{ margin: 0, fontSize: 16, fontWeight: 700, color: sColor, fontFamily: FONT_STACK, lineHeight: 1 }}>{sc}</p>
                 </div>
               );
             })}
@@ -1414,12 +1863,13 @@ function DragDivider({ onDrag, dark = false }: { onDrag: (dx: number) => void; d
 }
 
 // ── FileExplorer ──────────────────────────────────────────────
-function FileExplorer({ docState, docDispatch, collapsed, onToggle, onDocumentExtracted, expandedWidth }: {
+function FileExplorer({ docState, docDispatch, collapsed, onToggle, onDocumentExtracted, onRemoveDocument, expandedWidth }: {
   docState: DocumentState;
   docDispatch: React.Dispatch<DocumentAction>;
   collapsed: boolean;
   onToggle: () => void;
   onDocumentExtracted?: (filename: string, fileType: FileType, text: string) => void;
+  onRemoveDocument?: (filename: string) => void;
   expandedWidth: number;
 }) {
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
@@ -1491,7 +1941,7 @@ function FileExplorer({ docState, docDispatch, collapsed, onToggle, onDocumentEx
           </button>
           <span style={{
             fontSize: 9, fontWeight: 700, color: '#555555', letterSpacing: '2px',
-            fontFamily: "'Inter', sans-serif", textTransform: 'uppercase',
+            fontFamily: FONT_STACK, textTransform: 'uppercase',
             writingMode: 'vertical-rl', transform: 'rotate(180deg)',
             userSelect: 'none',
           }}>
@@ -1508,7 +1958,7 @@ function FileExplorer({ docState, docDispatch, collapsed, onToggle, onDocumentEx
           }}>
             <span style={{
               fontSize: 10, fontWeight: 700, color: '#9ca3af', letterSpacing: '1px',
-              fontFamily: "'Inter', sans-serif", textTransform: 'uppercase',
+              fontFamily: FONT_STACK, textTransform: 'uppercase',
             }}>
               Deal Documents
             </span>
@@ -1552,7 +2002,7 @@ function FileExplorer({ docState, docDispatch, collapsed, onToggle, onDocumentEx
           {/* File list */}
           <div style={{ flex: 1, overflowY: 'auto', padding: '6px 0' }}>
             {docState.documents.length === 0 ? (
-              <p style={{ fontSize: 11, color: '#555', textAlign: 'center', padding: '20px 12px', fontFamily: "'Inter', sans-serif" }}>
+              <p style={{ fontSize: 11, color: '#555', textAlign: 'center', padding: '20px 12px', fontFamily: FONT_STACK }}>
                 No documents
               </p>
             ) : (
@@ -1577,29 +2027,22 @@ function FileExplorer({ docState, docDispatch, collapsed, onToggle, onDocumentEx
                       position: 'relative',
                     }}
                   >
-                    <span style={{ fontSize: 14, flexShrink: 0, marginTop: 1 }}>{getFileIcon(doc.fileType)}</span>
+                    <span style={{ fontSize: 8, fontWeight: 700, flexShrink: 0, padding: '2px 4px', borderRadius: 2, background: getTypeBadgeColor(doc.fileType).bg, color: getTypeBadgeColor(doc.fileType).color, fontFamily: FONT_STACK }}>{getFileIcon(doc.fileType)}</span>
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{
                         fontSize: 11.5, color: isActive ? '#fff' : '#d1d5db',
-                        fontFamily: "'Inter', sans-serif", fontWeight: isActive ? 600 : 400,
+                        fontFamily: FONT_STACK, fontWeight: isActive ? 600 : 400,
                         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                         lineHeight: 1.3,
                       }}>
                         {doc.name.length > 22 ? doc.name.substring(0, 20) + '…' : doc.name}
                       </div>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 3, flexWrap: 'wrap' }}>
-                        <span style={{
-                          fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 3,
-                          background: badge.bg, color: badge.color, fontFamily: "'Inter', sans-serif",
-                          textTransform: 'uppercase',
-                        }}>
-                          {doc.fileType}
-                        </span>
-                        <span style={{ fontSize: 10, color: '#6b7280', fontFamily: "'Inter', sans-serif" }}>
+                        <span style={{ fontSize: 10, color: '#6b7280', fontFamily: FONT_STACK }}>
                           {doc.file ? formatFileSize(doc.file.size) : 'saved'}
                         </span>
                         {doc.isProcessing && (
-                          <span style={{ fontSize: 9, color: '#d97706', fontFamily: "'Inter', sans-serif" }}>
+                          <span style={{ fontSize: 9, color: '#d97706', fontFamily: FONT_STACK }}>
                             Processing…
                           </span>
                         )}
@@ -1610,6 +2053,8 @@ function FileExplorer({ docState, docDispatch, collapsed, onToggle, onDocumentEx
                       <button
                         onClick={e => {
                           e.stopPropagation();
+                          const name = docState.documents[index].name;
+                          onRemoveDocument?.(name);
                           docDispatch({ type: 'REMOVE_DOCUMENT', payload: index });
                         }}
                         title="Remove"
@@ -1637,32 +2082,31 @@ function FileExplorer({ docState, docDispatch, collapsed, onToggle, onDocumentEx
 
 // ── New Deal Modal ────────────────────────────────────────────
 function NewDealModal({ onConfirm, onCancel }: {
-  onConfirm: (name: string, sector: string) => void;
+  onConfirm: (name: string) => void;
   onCancel: () => void;
 }) {
   const [name, setName] = useState('');
-  const [sector, setSector] = useState('Private Equity');
   const inputRef = useRef<HTMLInputElement>(null);
   useEffect(() => { inputRef.current?.focus(); }, []);
 
   const handleSubmit = () => {
     const trimmed = name.trim();
     if (!trimmed) return;
-    onConfirm(trimmed, sector);
+    onConfirm(trimmed);
   };
 
   const inputStyle: React.CSSProperties = {
     width: '100%', padding: '9px 12px', borderRadius: 6,
-    border: '1px solid #e5e7eb', fontSize: 13, fontFamily: "'Inter', sans-serif",
+    border: '1px solid #e5e7eb', fontSize: 13, fontFamily: FONT_STACK,
     background: '#fff', color: NAVY, outline: 'none',
   };
 
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
       <div style={{ background: '#fff', borderRadius: 10, padding: 28, width: 440, boxShadow: '0 20px 60px rgba(0,0,0,0.2)' }}>
-        <p style={{ margin: '0 0 18px', fontSize: 16, fontWeight: 700, color: NAVY, fontFamily: "'Inter', sans-serif" }}>New Deal</p>
+        <p style={{ margin: '0 0 18px', fontSize: 16, fontWeight: 700, color: NAVY, fontFamily: FONT_STACK }}>New Deal</p>
         <div style={{ marginBottom: 14 }}>
-          <label style={{ display: 'block', marginBottom: 5, fontSize: 10, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: "'Inter', sans-serif" }}>
+          <label style={{ display: 'block', marginBottom: 5, fontSize: 10, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: FONT_STACK }}>
             Deal Name *
           </label>
           <input
@@ -1675,22 +2119,12 @@ function NewDealModal({ onConfirm, onCancel }: {
             style={inputStyle}
           />
         </div>
-        <div style={{ marginBottom: 22 }}>
-          <label style={{ display: 'block', marginBottom: 5, fontSize: 10, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: "'Inter', sans-serif" }}>
-            Strategy
-          </label>
-          <select value={sector} onChange={e => setSector(e.target.value)} style={{ ...inputStyle, appearance: 'none' }}>
-            <option>Private Equity</option>
-            <option>Private Credit</option>
-            <option>Venture Capital</option>
-            <option>Real Estate</option>
-          </select>
-        </div>
+        <div style={{ marginBottom: 22 }} />
         <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-          <button onClick={onCancel} style={{ padding: '9px 18px', background: 'none', border: '1px solid #e5e7eb', borderRadius: 6, fontSize: 13, fontFamily: "'Inter', sans-serif", cursor: 'pointer', color: '#6b7280' }}>
+          <button onClick={onCancel} style={{ padding: '9px 18px', background: 'none', border: '1px solid #e5e7eb', borderRadius: 6, fontSize: 13, fontFamily: FONT_STACK, cursor: 'pointer', color: '#6b7280' }}>
             Cancel
           </button>
-          <button onClick={handleSubmit} disabled={!name.trim()} style={{ padding: '9px 22px', background: RED, color: '#fff', border: 'none', borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: name.trim() ? 'pointer' : 'not-allowed', opacity: name.trim() ? 1 : 0.5, fontFamily: "'Inter', sans-serif" }}>
+          <button onClick={handleSubmit} disabled={!name.trim()} style={{ padding: '9px 22px', background: RED, color: '#fff', border: 'none', borderRadius: 6, fontSize: 13, fontWeight: 600, cursor: name.trim() ? 'pointer' : 'not-allowed', opacity: name.trim() ? 1 : 0.5, fontFamily: FONT_STACK }}>
             Create Deal
           </button>
         </div>
@@ -1700,6 +2134,13 @@ function NewDealModal({ onConfirm, onCancel }: {
 }
 
 // ── Home Screen ───────────────────────────────────────────────
+const SAMPLE_DEALS = [
+  { id: '__sample_1', name: 'Maple Healthcare Services', sector: 'Healthcare', verdict: 'Worth Deeper Look', status: 'Active', updated_at: '2026-03-15T10:00:00Z' },
+  { id: '__sample_2', name: 'NorthStar Logistics Group', sector: 'Logistics', verdict: null, status: 'Active', updated_at: '2026-03-12T14:30:00Z' },
+  { id: '__sample_3', name: 'Acadia Software Inc', sector: 'Technology', verdict: 'Passed', status: 'Passed', updated_at: '2026-03-08T09:15:00Z' },
+  { id: '__sample_4', name: 'Ridgeline Industrial', sector: 'Industrials', verdict: 'Worth Deeper Look', status: 'Active', updated_at: '2026-03-01T16:45:00Z' },
+];
+
 function HomeScreen({ deals, loading, onNewDeal, onOpenDeal, onDeleteDeal }: {
   deals: Deal[];
   loading: boolean;
@@ -1709,138 +2150,317 @@ function HomeScreen({ deals, loading, onNewDeal, onOpenDeal, onDeleteDeal }: {
 }) {
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [sectorFilter, setSectorFilter] = useState<string>("all");
+  const [verdictFilter, setVerdictFilter] = useState<string>("all");
+  const [statusFilter, setStatusFilter] = useState<string>("all");
+  const [sortOrder, setSortOrder] = useState<"updated_desc" | "updated_asc">("updated_desc");
 
-  const sectorBadgeStyle = (sector: string): React.CSSProperties => ({
-    fontSize: 10, fontWeight: 600, padding: '2px 7px', borderRadius: 20,
-    background: '#f5f5f5', color: '#6b7280', border: '1px solid #e5e7eb',
-    fontFamily: "'Inter', sans-serif", whiteSpace: 'nowrap',
+  const showSamples = !loading && deals.length === 0;
+  const displayDeals: any[] = showSamples ? SAMPLE_DEALS : deals;
+
+  const sectorOptions = Array.from(new Set(displayDeals.map(d => d.sector).filter(Boolean))).sort();
+  const statusOptions = Array.from(new Set(displayDeals.map(d => d.status).filter(Boolean))).sort();
+
+  const normalizedQuery = query.trim().toLowerCase();
+
+  let filteredDeals: any[] = displayDeals;
+  if (normalizedQuery) {
+    filteredDeals = filteredDeals.filter(d => String(d.name ?? "").toLowerCase().includes(normalizedQuery));
+  }
+  if (sectorFilter !== "all") {
+    filteredDeals = filteredDeals.filter(d => d.sector === sectorFilter);
+  }
+  if (statusFilter !== "all") {
+    filteredDeals = filteredDeals.filter(d => d.status === statusFilter);
+  }
+  if (verdictFilter !== "all") {
+    if (verdictFilter === "__none") filteredDeals = filteredDeals.filter(d => !d.verdict);
+    else filteredDeals = filteredDeals.filter(d => d.verdict === verdictFilter);
+  }
+
+  const toTs = (s: string) => {
+    const t = new Date(s).getTime();
+    return Number.isFinite(t) ? t : 0;
+  };
+  filteredDeals = [...filteredDeals].sort((a, b) => {
+    const diff = toTs(b.updated_at) - toTs(a.updated_at);
+    return sortOrder === "updated_desc" ? diff : -diff;
   });
+
+  const isDefaultFilters = !query && sectorFilter === "all" && verdictFilter === "all" && statusFilter === "all" && sortOrder === "updated_desc";
+  const clearFilters = () => {
+    setQuery("");
+    setSectorFilter("all");
+    setVerdictFilter("all");
+    setStatusFilter("all");
+    setSortOrder("updated_desc");
+  };
 
   return (
     <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: OFFWHITE }}>
       <style>{GLOBAL_STYLE}</style>
 
-      {/* Header */}
-      <div style={{ height: 52, background: RED, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 28px', flexShrink: 0 }}>
+      {/* Nav bar */}
+      <div style={{ height: 52, background: '#fff', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 28px', flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-          <span style={{ color: '#fff', fontFamily: "'Inter', sans-serif", fontWeight: 800, fontSize: 15, letterSpacing: '3px' }}>SAGARD</span>
-          <span style={{ color: 'rgba(255,255,255,0.7)', fontSize: 11, fontFamily: "'Inter', sans-serif", fontWeight: 600, letterSpacing: '2px' }}>DEAL ROOM</span>
+          <img src={process.env.PUBLIC_URL + '/sagard.svg'} height="28" alt="Sagard" style={{ display: 'block' }} />
+          <div style={{ width: 1, height: 20, background: '#e5e7eb' }} />
+          <span style={{ fontFamily: FONT_STACK, fontWeight: 600, fontSize: 13, color: '#6b7280' }}>CIM Analyzer</span>
         </div>
         <button
           onClick={onNewDeal}
-          style={{ background: '#fff', color: RED, border: `1px solid ${RED}`, borderRadius: 6, padding: '7px 18px', fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: "'Inter', sans-serif", letterSpacing: '0.5px' }}
+          style={{ background: RED, color: '#fff', border: 'none', borderRadius: 6, padding: '8px 16px', fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK }}
         >
-          + NEW DEAL
+          + New Deal
         </button>
       </div>
 
-      {/* Content */}
-      <div style={{ flex: 1, overflowY: 'auto', padding: '32px 0', maxWidth: 760, margin: '0 auto', width: '100%' }}>
-        <p style={{ margin: '0 0 20px 28px', fontSize: 11, fontWeight: 700, color: '#9ca3af', textTransform: 'uppercase', letterSpacing: '2px', fontFamily: "'Inter', sans-serif" }}>
-          {loading ? 'Loading…' : `${deals.length} deal${deals.length !== 1 ? 's' : ''}`}
-        </p>
-
-        {loading && (
-          <div style={{ padding: '0 28px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {[1, 2, 3].map(i => (
-              <div key={i} style={{ height: 76, background: '#fff', borderRadius: 8, border: '1px solid #e5e7eb', opacity: 0.5 + i * 0.15 }} />
-            ))}
+      {/* Hero strip */}
+      <div style={{ height: 80, background: '#fff', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', padding: '0 28px', gap: 20, flexShrink: 0 }}>
+        <div>
+          <p style={{ margin: 0, fontSize: 11, fontWeight: 700, color: '#9ca3af', letterSpacing: '2px', fontFamily: FONT_STACK }}>DEAL PIPELINE</p>
+          <p style={{ margin: '2px 0 0', fontSize: 22, fontWeight: 700, color: NAVY, fontFamily: FONT_STACK }}>
+            {loading ? '—' : deals.length}
+            <span style={{ fontSize: 12, fontWeight: 500, color: '#9ca3af', marginLeft: 6 }}>deals</span>
+          </p>
+        </div>
+        <div style={{ width: 1, height: 36, background: '#e5e7eb', marginLeft: 8 }} />
+        {[
+          { label: 'Active', value: deals.filter(d => d.status === 'Active').length, color: '#6b7280' },
+          { label: 'Worth Deeper Look', value: deals.filter(d => d.verdict === 'Worth Deeper Look').length, color: '#166534' },
+          { label: 'Passed', value: deals.filter(d => d.verdict === 'Passed').length, color: '#991b1b' },
+        ].map(stat => (
+          <div key={stat.label} style={{ display: 'flex', alignItems: 'center', gap: 6, background: '#f9fafb', border: '1px solid #e5e7eb', borderRadius: 6, padding: '6px 12px' }}>
+            <span style={{ fontSize: 15, fontWeight: 700, color: stat.color, fontFamily: FONT_STACK }}>{stat.value}</span>
+            <span style={{ fontSize: 11, color: '#6b7280', fontFamily: FONT_STACK }}>{stat.label}</span>
           </div>
-        )}
+        ))}
+      </div>
 
-        {!loading && deals.length === 0 && (
-          <div style={{ textAlign: 'center', padding: '72px 20px' }}>
-            <p style={{ fontSize: 18, fontWeight: 700, color: '#374151', fontFamily: "'Inter', sans-serif", margin: '0 0 8px' }}>No deals yet.</p>
-            <p style={{ fontSize: 13, color: '#9ca3af', fontFamily: "'Inter', sans-serif", margin: '0 0 24px' }}>Start by analyzing your first CIM.</p>
-            <button onClick={onNewDeal} style={{ background: RED, color: '#fff', border: 'none', borderRadius: 7, padding: '11px 28px', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: "'Inter', sans-serif" }}>
-              + Analyze your first CIM
+      {/* Filters / Search */}
+      <div style={{ background: '#fff', borderBottom: '1px solid #e5e7eb', padding: '12px 28px', flexShrink: 0 }}>
+        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'flex-end' }}>
+          <div style={{ flex: '1 1 280px', minWidth: 220 }}>
+            <label style={{ display: 'block', marginBottom: 5, fontSize: 10, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: FONT_STACK }}>
+              Search deals
+            </label>
+            <input
+              type="text"
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              placeholder="Type a deal name…"
+              style={{ width: '100%', border: '1px solid #e5e7eb', borderRadius: 8, padding: '9px 12px', fontSize: 13, fontFamily: FONT_STACK, outline: 'none', background: '#fff' }}
+            />
+          </div>
+
+          <div style={{ minWidth: 180 }}>
+            <label style={{ display: 'block', marginBottom: 5, fontSize: 10, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: FONT_STACK }}>
+              Sector
+            </label>
+            <select
+              value={sectorFilter}
+              onChange={e => setSectorFilter(e.target.value)}
+              style={{ width: '100%', border: '1px solid #e5e7eb', borderRadius: 8, padding: '9px 12px', fontSize: 13, fontFamily: FONT_STACK, outline: 'none', background: '#fff', appearance: 'none' }}
+            >
+              <option value="all">All sectors</option>
+              {sectorOptions.map(s => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+          </div>
+
+          <div style={{ minWidth: 200 }}>
+            <label style={{ display: 'block', marginBottom: 5, fontSize: 10, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: FONT_STACK }}>
+              Verdict
+            </label>
+            <select
+              value={verdictFilter}
+              onChange={e => setVerdictFilter(e.target.value)}
+              style={{ width: '100%', border: '1px solid #e5e7eb', borderRadius: 8, padding: '9px 12px', fontSize: 13, fontFamily: FONT_STACK, outline: 'none', background: '#fff', appearance: 'none' }}
+            >
+              <option value="all">All verdicts</option>
+              <option value="Worth Deeper Look">Worth Deeper Look</option>
+              <option value="Passed">Passed</option>
+              <option value="__none">No verdict</option>
+            </select>
+          </div>
+
+          <div style={{ minWidth: 170 }}>
+            <label style={{ display: 'block', marginBottom: 5, fontSize: 10, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: FONT_STACK }}>
+              Status
+            </label>
+            <select
+              value={statusFilter}
+              onChange={e => setStatusFilter(e.target.value)}
+              style={{ width: '100%', border: '1px solid #e5e7eb', borderRadius: 8, padding: '9px 12px', fontSize: 13, fontFamily: FONT_STACK, outline: 'none', background: '#fff', appearance: 'none' }}
+            >
+              <option value="all">All status</option>
+              {statusOptions.map(s => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
+          </div>
+
+          <div style={{ minWidth: 190 }}>
+            <label style={{ display: 'block', marginBottom: 5, fontSize: 10, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', letterSpacing: '1px', fontFamily: FONT_STACK }}>
+              Sort
+            </label>
+            <select
+              value={sortOrder}
+              onChange={e => setSortOrder(e.target.value as any)}
+              style={{ width: '100%', border: '1px solid #e5e7eb', borderRadius: 8, padding: '9px 12px', fontSize: 13, fontFamily: FONT_STACK, outline: 'none', background: '#fff', appearance: 'none' }}
+            >
+              <option value="updated_desc">Last updated (newest)</option>
+              <option value="updated_asc">Last updated (oldest)</option>
+            </select>
+          </div>
+
+          <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'flex-end', gap: 10, paddingBottom: 18 }}>
+            <div style={{ fontSize: 12, color: '#6b7280', fontFamily: FONT_STACK }}>
+              Showing <strong style={{ color: NAVY }}>{filteredDeals.length}</strong> of <strong style={{ color: NAVY }}>{displayDeals.length}</strong>
+            </div>
+            <button
+              onClick={clearFilters}
+              disabled={isDefaultFilters}
+              style={{
+                padding: '8px 12px',
+                background: isDefaultFilters ? '#f3f4f6' : 'none',
+                border: '1px solid #e5e7eb',
+                borderRadius: 8,
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: isDefaultFilters ? 'not-allowed' : 'pointer',
+                fontFamily: FONT_STACK,
+                color: isDefaultFilters ? '#9ca3af' : '#374151',
+              }}
+            >
+              Clear
             </button>
           </div>
-        )}
+        </div>
+      </div>
 
-        {!loading && deals.length > 0 && (
-          <div style={{ padding: '0 28px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {deals.map(deal => {
-              const isHovered = hoveredId === deal.id;
-              const pill = deal.verdict ? dealVerdictPill[deal.verdict] : null;
-              const statusColor: Record<string, string> = {
-                'Active': '#6b7280', 'Worth Deeper Look': '#166534', 'Passed': '#991b1b', 'Closed': '#374151',
-              };
-              return (
-                <div
-                  key={deal.id}
-                  onClick={() => onOpenDeal(deal)}
-                  onMouseEnter={() => setHoveredId(deal.id)}
-                  onMouseLeave={() => { setHoveredId(null); setConfirmDeleteId(null); }}
-                  style={{
-                    background: isHovered ? '#fef3f2' : '#fff',
-                    border: `1px solid ${isHovered ? '#fecaca' : '#e5e7eb'}`,
-                    borderRadius: 8, padding: '14px 18px',
-                    display: 'flex', alignItems: 'center', gap: 14,
-                    cursor: 'pointer', transition: 'all 0.15s',
-                    boxShadow: isHovered ? '0 2px 8px rgba(145,61,62,0.08)' : '0 1px 2px rgba(0,0,0,0.04)',
-                  }}
-                >
-                  {/* Deal name + meta */}
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 5, flexWrap: 'wrap' }}>
-                      <span style={{ fontSize: 14, fontWeight: 600, color: NAVY, fontFamily: "'Inter', sans-serif", overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 280 }}>
-                        {deal.name}
-                      </span>
-                      <span style={sectorBadgeStyle(deal.sector)}>{deal.sector}</span>
-                      {pill && (
-                        <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 20, background: pill.bg, color: pill.color, border: `1px solid ${pill.border}`, fontFamily: "'Inter', sans-serif" }}>
+      {/* Table */}
+      <div style={{ flex: 1, overflowY: 'auto', padding: '0 28px' }}>
+        {loading ? (
+          <div style={{ padding: '0 0', display: 'flex', flexDirection: 'column' }}>
+            {[1, 2, 3].map(i => (
+              <div key={i} style={{ height: 52, background: '#fff', borderBottom: '1px solid #e5e7eb', opacity: 0.4 + i * 0.1 }} />
+            ))}
+          </div>
+        ) : (
+          filteredDeals.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: '44px 20px 60px' }}>
+              <img
+                src={process.env.PUBLIC_URL + '/sagard.svg'}
+                height="28"
+                alt="Sagard"
+                style={{ opacity: 0.12, marginBottom: 14, display: 'block', marginLeft: 'auto', marginRight: 'auto' }}
+              />
+              <p style={{ fontSize: 13, color: '#9ca3af', fontFamily: FONT_STACK, margin: '0 0 8px' }}>
+                No deals match your filters.
+              </p>
+              <p style={{ fontSize: 12, color: '#6b7280', fontFamily: FONT_STACK, margin: '0 0 16px' }}>
+                Try adjusting the filters or clearing them.
+              </p>
+              <button onClick={clearFilters} style={{ background: RED, color: '#fff', border: 'none', borderRadius: 6, padding: '10px 22px', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK }}>
+                Reset filters
+              </button>
+            </div>
+          ) : (
+          <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid #e5e7eb', background: '#fff' }}>
+                {['DEAL NAME', 'SECTOR', 'VERDICT', 'LAST UPDATED', 'STATUS'].map(col => (
+                  <th key={col} style={{ padding: '10px 20px', textAlign: 'left', fontSize: 10, fontWeight: 700, color: '#9ca3af', letterSpacing: '1.5px', fontFamily: FONT_STACK, whiteSpace: 'nowrap', position: 'sticky', top: 0, zIndex: 2, background: '#fff' }}>
+                    {col}
+                  </th>
+                ))}
+                <th style={{ width: 170, position: 'sticky', top: 0, zIndex: 2, background: '#fff' }} />
+              </tr>
+            </thead>
+            <tbody>
+              {filteredDeals.map((deal: any) => {
+                const isSample = String(deal.id).startsWith('__sample');
+                const isHovered = hoveredId === deal.id;
+                const pill = deal.verdict ? dealVerdictPill[deal.verdict as string] : null;
+                return (
+                  <tr
+                    key={deal.id}
+                    onMouseEnter={() => setHoveredId(deal.id)}
+                    onMouseLeave={() => { setHoveredId(null); setConfirmDeleteId(null); }}
+                    onClick={() => isSample ? onNewDeal() : onOpenDeal(deal as Deal)}
+                    style={{ borderBottom: '1px solid #e5e7eb', background: isHovered ? '#fef9f9' : '#fff', cursor: 'pointer', transition: 'background 0.1s' }}
+                  >
+                    <td style={{ padding: '14px 20px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ fontSize: 13, fontWeight: 600, color: NAVY, fontFamily: FONT_STACK }}>{deal.name}</span>
+                        {isSample && (
+                          <span style={{ fontSize: 9, fontWeight: 700, padding: '1px 5px', borderRadius: 3, background: '#f3f4f6', color: '#9ca3af', border: '1px solid #e5e7eb', fontFamily: FONT_STACK, letterSpacing: '0.5px' }}>SAMPLE</span>
+                        )}
+                      </div>
+                    </td>
+                    <td style={{ padding: '14px 20px' }}>
+                      <span style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', fontFamily: FONT_STACK, background: '#f5f5f5', border: '1px solid #e5e7eb', borderRadius: 20, padding: '2px 8px', whiteSpace: 'nowrap' }}>{deal.sector}</span>
+                    </td>
+                    <td style={{ padding: '14px 20px' }}>
+                      {pill ? (
+                        <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 20, background: pill.bg, color: pill.color, border: `1px solid ${pill.border}`, fontFamily: FONT_STACK, whiteSpace: 'nowrap' }}>
                           {deal.verdict}
                         </span>
+                      ) : (
+                        <span style={{ fontSize: 12, color: '#d1d5db', fontFamily: FONT_STACK }}>—</span>
                       )}
-                    </div>
-                    <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-                      <span style={{ fontSize: 11, color: statusColor[deal.status] ?? '#6b7280', fontFamily: "'Inter', sans-serif", fontWeight: 500 }}>
+                    </td>
+                    <td style={{ padding: '14px 20px' }}>
+                      <span style={{ fontSize: 12, color: '#6b7280', fontFamily: FONT_STACK }}>{formatRelativeTime(deal.updated_at)}</span>
+                    </td>
+                    <td style={{ padding: '14px 20px' }}>
+                      <span style={{ fontSize: 11, fontWeight: 500, fontFamily: FONT_STACK, color: deal.status === 'Passed' ? '#991b1b' : deal.status === 'Worth Deeper Look' ? '#166534' : '#6b7280' }}>
                         {deal.status}
                       </span>
-                      <span style={{ fontSize: 11, color: '#9ca3af', fontFamily: "'Inter', sans-serif" }}>
-                        Updated {formatRelativeTime(deal.updated_at)}
-                      </span>
-                    </div>
-                  </div>
+                    </td>
+                    <td style={{ padding: '14px 20px', textAlign: 'right', width: 170, minWidth: 170 }} onClick={e => e.stopPropagation()}>
+                      {!isSample && (
+                        <div style={{ minHeight: 28, display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 6, whiteSpace: 'nowrap' }}>
+                          {confirmDeleteId === deal.id ? (
+                            <>
+                              <span style={{ fontSize: 11, color: '#6b7280', fontFamily: FONT_STACK }}>Delete?</span>
+                              <button onClick={() => { onDeleteDeal(deal.id); setConfirmDeleteId(null); }} style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 4, padding: '3px 8px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK }}>Yes</button>
+                              <button onClick={() => setConfirmDeleteId(null)} style={{ background: '#f3f4f6', color: '#374151', border: '1px solid #e5e7eb', borderRadius: 4, padding: '3px 8px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK }}>No</button>
+                            </>
+                          ) : isHovered ? (
+                            <button
+                              onClick={() => setConfirmDeleteId(deal.id)}
+                              style={{ background: 'none', border: '1px solid #e5e7eb', borderRadius: 4, padding: '3px 8px', fontSize: 11, color: '#9ca3af', cursor: 'pointer', fontFamily: FONT_STACK }}
+                              onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = '#dc2626'; (e.currentTarget as HTMLButtonElement).style.color = '#dc2626'; }}
+                              onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = '#e5e7eb'; (e.currentTarget as HTMLButtonElement).style.color = '#9ca3af'; }}
+                            >
+                              Delete
+                            </button>
+                          ) : (
+                            <div style={{ width: 68, height: 22 }} />
+                          )}
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          )
+        )}
 
-                  {/* Actions */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }} onClick={e => e.stopPropagation()}>
-                    {confirmDeleteId === deal.id ? (
-                      <>
-                        <span style={{ fontSize: 11, color: '#6b7280', fontFamily: "'Inter', sans-serif" }}>Delete?</span>
-                        <button
-                          onClick={() => { onDeleteDeal(deal.id); setConfirmDeleteId(null); }}
-                          style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 5, padding: '4px 10px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: "'Inter', sans-serif" }}
-                        >
-                          Yes
-                        </button>
-                        <button
-                          onClick={() => setConfirmDeleteId(null)}
-                          style={{ background: '#f3f4f6', color: '#374151', border: '1px solid #e5e7eb', borderRadius: 5, padding: '4px 10px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: "'Inter', sans-serif" }}
-                        >
-                          No
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        {isHovered && (
-                          <button
-                            onClick={() => setConfirmDeleteId(deal.id)}
-                            style={{ background: 'none', border: '1px solid #e5e7eb', borderRadius: 5, padding: '4px 8px', fontSize: 11, color: '#9ca3af', cursor: 'pointer', fontFamily: "'Inter', sans-serif", transition: 'all 0.15s' }}
-                            onMouseEnter={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = '#dc2626'; (e.currentTarget as HTMLButtonElement).style.color = '#dc2626'; }}
-                            onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.borderColor = '#e5e7eb'; (e.currentTarget as HTMLButtonElement).style.color = '#9ca3af'; }}
-                          >
-                            Delete
-                          </button>
-                        )}
-                        <span style={{ color: isHovered ? RED : '#d1d5db', fontSize: 18, fontWeight: 300, transition: 'color 0.15s' }}>→</span>
-                      </>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
+        {/* Empty-state prompt below sample rows */}
+        {showSamples && isDefaultFilters && (
+          <div style={{ textAlign: 'center', padding: '36px 20px 60px', borderTop: '1px solid #e5e7eb' }}>
+            <img src={process.env.PUBLIC_URL + '/sagard.svg'} height="28" alt="Sagard" style={{ opacity: 0.12, marginBottom: 16, display: 'block', margin: '0 auto 16px' }} />
+            <p style={{ fontSize: 13, color: '#9ca3af', fontFamily: FONT_STACK, margin: '0 0 20px' }}>These are sample deals. Add your first CIM to get started.</p>
+            <button onClick={onNewDeal} style={{ background: RED, color: '#fff', border: 'none', borderRadius: 6, padding: '10px 24px', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK }}>
+              + New Deal
+            </button>
           </div>
         )}
       </div>
@@ -1858,8 +2478,8 @@ function CompsTab({ compsData, loading }: { compsData: CompsData | null; loading
     return (
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16, background: OFFWHITE, padding: 40 }}>
         <div style={{ width: 32, height: 32, border: `3px solid #e5e7eb`, borderTop: `3px solid ${RED}`, borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
-        <p style={{ color: '#6b7280', fontSize: 13, fontFamily: 'Inter, sans-serif', margin: 0 }}>Searching for comparable transactions…</p>
-        <p style={{ color: '#9ca3af', fontSize: 11, fontFamily: 'Inter, sans-serif', margin: 0 }}>Running targeted M&A database searches</p>
+        <p style={{ color: '#6b7280', fontSize: 13, fontFamily: FONT_STACK, margin: 0 }}>Searching for comparable transactions…</p>
+        <p style={{ color: '#9ca3af', fontSize: 11, fontFamily: FONT_STACK, margin: 0 }}>Running targeted M&A database searches</p>
       </div>
     );
   }
@@ -1867,7 +2487,7 @@ function CompsTab({ compsData, loading }: { compsData: CompsData | null; loading
   if (!compsData) {
     return (
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: OFFWHITE }}>
-        <p style={{ color: '#9ca3af', fontSize: 13, fontFamily: 'Inter, sans-serif' }}>No comparable transaction data available.</p>
+        <p style={{ color: '#9ca3af', fontSize: 13, fontFamily: FONT_STACK }}>No comparable transaction data available.</p>
       </div>
     );
   }
@@ -1911,36 +2531,36 @@ function CompsTab({ compsData, loading }: { compsData: CompsData | null; loading
       <div style={{ background: '#fff', padding: '14px 16px', borderBottom: '1px solid #e5e7eb' }}>
         <p style={{ margin: '0 0 8px', ...sectionLabel }}>SEARCH PROFILE</p>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
-          <span style={{ fontSize: 11, fontWeight: 600, background: '#1a1a1a', color: '#fff', borderRadius: 4, padding: '2px 8px', fontFamily: 'Inter, sans-serif' }}>
+          <span style={{ fontSize: 11, fontWeight: 600, background: '#1a1a1a', color: '#fff', borderRadius: 4, padding: '2px 8px', fontFamily: FONT_STACK }}>
             {deal_profile?.sector}
           </span>
           {deal_profile?.sub_sector && (
-            <span style={{ fontSize: 11, fontWeight: 600, background: '#f5f5f5', color: '#374151', borderRadius: 4, padding: '2px 8px', border: '1px solid #e5e7eb', fontFamily: 'Inter, sans-serif' }}>
+            <span style={{ fontSize: 11, fontWeight: 600, background: '#f5f5f5', color: '#374151', borderRadius: 4, padding: '2px 8px', border: '1px solid #e5e7eb', fontFamily: FONT_STACK }}>
               {deal_profile.sub_sector}
             </span>
           )}
           {deal_profile?.geography && (
-            <span style={{ fontSize: 11, color: '#6b7280', background: '#f5f5f5', borderRadius: 4, padding: '2px 8px', border: '1px solid #e5e7eb', fontFamily: 'Inter, sans-serif' }}>
+            <span style={{ fontSize: 11, color: '#6b7280', background: '#f5f5f5', borderRadius: 4, padding: '2px 8px', border: '1px solid #e5e7eb', fontFamily: FONT_STACK }}>
               {deal_profile.geography}
             </span>
           )}
         </div>
-        <p style={{ margin: '0 0 6px', fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: 'Inter, sans-serif' }}>
+        <p style={{ margin: '0 0 6px', fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: FONT_STACK }}>
           {deal_profile?.description}
         </p>
         <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
           {deal_profile?.revenue_millions && (
-            <span style={{ fontSize: 11, color: '#6b7280', fontFamily: 'Inter, sans-serif' }}>
+            <span style={{ fontSize: 11, color: '#6b7280', fontFamily: FONT_STACK }}>
               Revenue: <strong style={{ color: '#1a1a1a' }}>${deal_profile.revenue_millions}M</strong>
             </span>
           )}
           {deal_profile?.ebitda_millions && (
-            <span style={{ fontSize: 11, color: '#6b7280', fontFamily: 'Inter, sans-serif' }}>
+            <span style={{ fontSize: 11, color: '#6b7280', fontFamily: FONT_STACK }}>
               EBITDA: <strong style={{ color: '#1a1a1a' }}>${deal_profile.ebitda_millions}M</strong>
             </span>
           )}
           {deal_profile?.ebitda_margin_pct && (
-            <span style={{ fontSize: 11, color: '#6b7280', fontFamily: 'Inter, sans-serif' }}>
+            <span style={{ fontSize: 11, color: '#6b7280', fontFamily: FONT_STACK }}>
               Margin: <strong style={{ color: '#1a1a1a' }}>{deal_profile.ebitda_margin_pct}%</strong>
             </span>
           )}
@@ -1951,10 +2571,10 @@ function CompsTab({ compsData, loading }: { compsData: CompsData | null; loading
       <div style={{ background: '#fff', margin: '6px 0', padding: '14px 16px', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
         <p style={{ margin: '0 0 10px', ...sectionLabel }}>COMPARABLE TRANSACTIONS ({comps?.length ?? 0})</p>
         {(comps?.length ?? 0) === 0 ? (
-          <p style={{ fontSize: 12, color: '#9ca3af', fontFamily: 'Inter, sans-serif' }}>No confirmed comparable transactions found in public sources.</p>
+          <p style={{ fontSize: 12, color: '#9ca3af', fontFamily: FONT_STACK }}>No confirmed comparable transactions found in public sources.</p>
         ) : (
           <div style={{ overflowX: 'auto' }}>
-            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11, fontFamily: 'Inter, sans-serif' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11, fontFamily: FONT_STACK }}>
               <thead>
                 <tr style={{ background: '#f8f6f3', borderBottom: '2px solid #e5e7eb' }}>
                   {['Company', 'Acquirer', 'Date', 'EV', 'EV/EBITDA', 'EV/Rev', 'Notes'].map(h => (
@@ -1984,8 +2604,16 @@ function CompsTab({ compsData, loading }: { compsData: CompsData | null; loading
                       <td style={{ padding: '8px 10px', textAlign: 'right', color: '#374151', whiteSpace: 'nowrap' }}>{fmtEV(comp.ev_millions)}</td>
                       <td style={{ padding: '8px 10px', textAlign: 'right', fontWeight: 700, color: multipleColor, whiteSpace: 'nowrap' }}>{fmt(comp.ev_ebitda)}</td>
                       <td style={{ padding: '8px 10px', textAlign: 'right', color: '#374151', whiteSpace: 'nowrap' }}>{fmt(comp.ev_revenue)}</td>
-                      <td style={{ padding: '8px 10px', color: '#6b7280', maxWidth: 140 }}>
-                        <div title={comp.why_comparable} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      <td style={{ padding: '8px 10px', color: '#6b7280', minWidth: 260, verticalAlign: 'top' }}>
+                        <div
+                          title={comp.why_comparable}
+                          style={{
+                            whiteSpace: 'normal',
+                            wordBreak: 'break-word',
+                            overflowWrap: 'anywhere',
+                            lineHeight: 1.4,
+                          }}
+                        >
                           {comp.why_comparable}
                         </div>
                       </td>
@@ -2027,57 +2655,17 @@ function CompsTab({ compsData, loading }: { compsData: CompsData | null; loading
         )}
       </div>
 
-      {/* Multiple Range Chart */}
-      {chartData.length > 0 && (
-        <div style={{ background: '#fff', margin: '6px 0', padding: '14px 16px', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
-          <p style={{ margin: '0 0 4px', ...sectionLabel }}>EV/EBITDA MULTIPLE RANGE</p>
-          <p style={{ margin: '0 0 12px', fontSize: 11, color: '#9ca3af', fontFamily: 'Inter, sans-serif' }}>
-            Comparable transactions vs. this deal
-          </p>
-          <ResponsiveContainer width="100%" height={chartData.length * 36 + 50}>
-            <BarChart layout="vertical" data={chartData} margin={{ top: 5, right: 40, left: 0, bottom: 5 }}>
-              <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f0ede8" />
-              <XAxis
-                type="number"
-                domain={[0, maxMultiple]}
-                tick={{ fontSize: 10 }}
-                tickFormatter={(v) => `${v}x`}
-              />
-              <YAxis
-                type="category"
-                dataKey="name"
-                width={130}
-                tick={{ fontSize: 10, fontFamily: 'Inter, sans-serif' }}
-              />
-              <Tooltip
-                formatter={(v: any) => [`${(v as number).toFixed(1)}x EV/EBITDA`, '']}
-                contentStyle={{ fontFamily: 'Inter, sans-serif', fontSize: 11 }}
-              />
-              <Bar dataKey="multiple" radius={[0, 3, 3, 0]}>
-                {chartData.map((entry, i) => (
-                  <Cell key={i} fill={entry.isThisDeal ? RED : entry.multiple && sectorHigh && entry.multiple > sectorHigh ? '#d97706' : NAVY} />
-                ))}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-          {sectorLow && sectorHigh && (
-            <p style={{ margin: '4px 0 0', fontSize: 10, color: '#9ca3af', fontFamily: 'Inter, sans-serif', textAlign: 'center' }}>
-              Sector range: {sectorLow.toFixed(1)}x – {sectorHigh.toFixed(1)}x EV/EBITDA
-            </p>
-          )}
-        </div>
-      )}
 
       {/* Deal Positioning */}
       {this_deal_positioning?.vs_comp_set && this_deal_positioning.vs_comp_set !== 'Cannot determine' && (
         <div style={{ background: '#fff', margin: '6px 0', padding: '14px 16px', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
             <p style={{ margin: 0, ...sectionLabel }}>DEAL POSITIONING</p>
-            <span style={{ fontSize: 11, fontWeight: 700, color: vsColor, background: vsColor + '15', border: `1px solid ${vsColor}40`, borderRadius: 4, padding: '2px 8px', fontFamily: 'Inter, sans-serif' }}>
+            <span style={{ fontSize: 11, fontWeight: 700, color: vsColor, background: vsColor + '15', border: `1px solid ${vsColor}40`, borderRadius: 4, padding: '2px 8px', fontFamily: FONT_STACK }}>
               {this_deal_positioning.vs_comp_set.toUpperCase()}
             </span>
           </div>
-          <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.6, fontFamily: 'Inter, sans-serif' }}>
+          <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.6, fontFamily: FONT_STACK }}>
             {this_deal_positioning.rationale}
           </p>
         </div>
@@ -2090,7 +2678,7 @@ function CompsTab({ compsData, loading }: { compsData: CompsData | null; loading
             <p style={{ margin: '0 0 8px', ...sectionLabel, color: '#16a34a' }}>PREMIUM DRIVERS</p>
             {(sector_context.multiple_drivers ?? []).map((d, i) => (
               <div key={i} style={{ borderLeft: '2px solid #16a34a', paddingLeft: 8, marginBottom: 6 }}>
-                <p style={{ margin: 0, fontSize: 11, color: '#374151', lineHeight: 1.4, fontFamily: 'Inter, sans-serif' }}>{d}</p>
+                <p style={{ margin: 0, fontSize: 11, color: '#374151', lineHeight: 1.4, fontFamily: FONT_STACK }}>{d}</p>
               </div>
             ))}
           </div>
@@ -2098,7 +2686,7 @@ function CompsTab({ compsData, loading }: { compsData: CompsData | null; loading
             <p style={{ margin: '0 0 8px', ...sectionLabel, color: '#dc2626' }}>DISCOUNT DRIVERS</p>
             {(sector_context.discount_drivers ?? []).map((d, i) => (
               <div key={i} style={{ borderLeft: '2px solid #dc2626', paddingLeft: 8, marginBottom: 6 }}>
-                <p style={{ margin: 0, fontSize: 11, color: '#374151', lineHeight: 1.4, fontFamily: 'Inter, sans-serif' }}>{d}</p>
+                <p style={{ margin: 0, fontSize: 11, color: '#374151', lineHeight: 1.4, fontFamily: FONT_STACK }}>{d}</p>
               </div>
             ))}
           </div>
@@ -2110,15 +2698,15 @@ function CompsTab({ compsData, loading }: { compsData: CompsData | null; loading
         <div style={{ background: '#fff', margin: '0 0 6px', padding: '14px 16px', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
           <p style={{ margin: '0 0 10px', ...sectionLabel }}>VALUATION CONTEXT</p>
           {valuation_context.split('\n\n').filter(Boolean).map((para, i) => (
-            <p key={i} style={{ margin: '0 0 10px', fontSize: 12, color: '#374151', lineHeight: 1.7, fontFamily: 'Inter, sans-serif' }}>{para}</p>
+            <p key={i} style={{ margin: '0 0 10px', fontSize: 12, color: '#374151', lineHeight: 1.7, fontFamily: FONT_STACK }}>{para}</p>
           ))}
         </div>
       )}
 
       {/* Data Quality Notice */}
       <div style={{ margin: '0 0 16px', padding: '10px 16px', background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 6, marginLeft: 16, marginRight: 16 }}>
-        <p style={{ margin: 0, fontSize: 11, color: '#92400e', fontFamily: 'Inter, sans-serif', lineHeight: 1.5 }}>
-          <strong>Data Quality:</strong> {data_quality_note ?? 'Comps are sourced from public web data and may be incomplete. Verify with PitchBook or CapIQ before use in any IC memo.'}
+        <p style={{ margin: 0, fontSize: 11, color: '#92400e', fontFamily: FONT_STACK, lineHeight: 1.5 }}>
+          <span style={{ fontWeight: 500 }}>Data Quality:</span> {data_quality_note ?? 'Comps are sourced from public web data and may be incomplete. Verify with PitchBook or CapIQ before use in any IC memo.'}
         </p>
       </div>
 
@@ -2130,7 +2718,7 @@ function Results({
   data, uploadedFiles, onReset, documentText, documentsText, chartsData,
   compsData, compsLoading, savedDocEntries, initialChatMessages,
   dealName, dealStatus, onStatusChange, onSaveChatMessage, saveError, onBackToHome,
-  onDocumentExtracted,
+  onDocumentExtracted, onRemoveDocument, sector,
 }: {
   data: AnalysisResult;
   uploadedFiles: File[];
@@ -2149,6 +2737,8 @@ function Results({
   saveError: boolean;
   onBackToHome: () => void;
   onDocumentExtracted?: (filename: string, fileType: FileType, text: string) => void;
+  onRemoveDocument?: (filename: string) => void;
+  sector: string;
 }) {
   const { assessment, claims, cross_document_conflicts } = data;
   const [activeClaim, setActiveClaim] = useState<number | null>(null);
@@ -2257,6 +2847,39 @@ function Results({
     }
   }, [uploadedFiles, savedDocEntries]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // Tracks which Excel sheet to display (set by window.jumpToSheet)
+  const [requestedSheet, setRequestedSheet] = useState<string | null>(null);
+
+  // Expose window.jumpToSheet — switches to the right Excel doc and activates the named sheet
+  useEffect(() => {
+    (window as any).jumpToSheet = (sheetName: string, docName?: string) => {
+      const state = docStateRef.current;
+      let targetIndex = state.activeIndex;
+
+      if (docName) {
+        const clean = docName.trim().toLowerCase().replace(/\.(xlsx|xls|xlsm)$/i, '').replace(/[-_]/g, ' ').trim();
+        const scored = state.documents.map((doc: DocEntry, index: number) => {
+          const docClean = doc.name.toLowerCase().replace(/\.(xlsx|xls|xlsm)$/i, '').replace(/[-_]/g, ' ').trim();
+          let score = 0;
+          if (docClean === clean) score += 100;
+          if (docClean.includes(clean) || clean.includes(docClean)) score += 50;
+          return { index, score };
+        });
+        scored.sort((a: any, b: any) => b.score - a.score);
+        if (scored[0].score > 0) targetIndex = scored[0].index;
+      }
+
+      if (targetIndex !== state.activeIndex) {
+        docDispatch({ type: 'SWITCH_DOCUMENT', payload: targetIndex });
+      }
+      setRequestedSheet(sheetName);
+      setTimeout(() => {
+        document.getElementById('pdf-viewer-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 100);
+    };
+    return () => { delete (window as any).jumpToSheet; };
+  }, []);
+
   // Expose window.jumpToPage — registered once, reads only docStateRef (always current)
   useEffect(() => {
     (window as any).jumpToPage = (page: number, docName?: string) => {
@@ -2347,13 +2970,17 @@ function Results({
       formData.append('document_text', allDocText || documentText);
       formData.append('history', JSON.stringify(historySnapshot));
       formData.append('document_names', docStateRef.current.documents.map(d => d.name).join(', '));
+      formData.append('sector', sector);
       const { data: resp } = await axios.post<{ response: string }>(`${API_BASE_URL}/chat`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
+      console.log('[Chat] Raw response:', resp.response?.substring(0, 300));
+      const parsedSegments = parseResponseSegments(resp.response);
+      console.log('[Chat] Segments:', parsedSegments.map(s => s.type === 'chart' ? `chart(${s.chartData?.type})` : `text(${s.content.length}ch)`));
       const assistantMsg: ChatMessage = {
         role: 'assistant',
         content: resp.response,
-        segments: parseResponseSegments(resp.response),
+        segments: parsedSegments,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       };
       setChatMessages(prev => [...prev, assistantMsg]);
@@ -2373,13 +3000,18 @@ function Results({
   };
 
   const exportICBrief = () => {
-    const div = document.createElement("div");
-    div.id = "ic-brief-print";
-    div.style.cssText = "display:none;";
-    div.innerHTML = buildICBrief(assessment, claims, conflicts, uploadedFiles[0]?.name ?? 'Document');
-    document.body.appendChild(div);
-    window.print();
-    document.body.removeChild(div);
+    const iframe = document.createElement('iframe');
+    iframe.style.cssText = 'position:fixed;right:0;bottom:0;width:0;height:0;border:0;visibility:hidden;';
+    document.body.appendChild(iframe);
+    const doc = iframe.contentDocument ?? iframe.contentWindow?.document;
+    if (!doc) { document.body.removeChild(iframe); return; }
+    doc.write(buildICBrief(assessment, claims, conflicts, uploadedFiles[0]?.name ?? 'Document', compsData, dealName, chartsData));
+    doc.close();
+    setTimeout(() => {
+      iframe.contentWindow?.focus();
+      iframe.contentWindow?.print();
+      setTimeout(() => document.body.removeChild(iframe), 2000);
+    }, 500);
   };
 
   const filteredClaims = claims.filter(c =>
@@ -2387,8 +3019,8 @@ function Results({
   );
 
   const panelBtnBase: React.CSSProperties = {
-    padding: '4px 10px', border: '1px solid #e5e7eb', borderRadius: 4,
-    fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: 'Inter, sans-serif',
+    padding: '4px 10px', border: '1px solid #e5e7eb', borderRadius: 8,
+    fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK,
     whiteSpace: 'nowrap',
   };
 
@@ -2402,13 +3034,13 @@ function Results({
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <button
             onClick={onBackToHome}
-            style={{ background: 'rgba(255,255,255,0.15)', border: '1px solid rgba(255,255,255,0.25)', color: '#fff', borderRadius: 5, padding: '4px 11px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: "'Inter', sans-serif", whiteSpace: 'nowrap' }}
+            style={{ background: 'rgba(255,255,255,0.15)', border: '1px solid rgba(255,255,255,0.25)', color: '#fff', borderRadius: 5, padding: '4px 11px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK, whiteSpace: 'nowrap' }}
           >
             ← All Deals
           </button>
-          <span style={{ color: "#fff", fontFamily: "'Inter', sans-serif", fontWeight: 800, fontSize: 15, letterSpacing: "3px" }}>SAGARD</span>
+          <img src="/sagard.svg" alt="Sagard" style={{ height: 28, width: 'auto', display: 'block', filter: 'brightness(0) invert(1)' }} />
           {dealName && (
-            <span style={{ color: "rgba(255,255,255,0.85)", fontSize: 12, fontFamily: "'Inter', sans-serif", fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 260 }}>
+            <span style={{ color: "rgba(255,255,255,0.85)", fontSize: 12, fontFamily: FONT_STACK, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 260 }}>
               {dealName}
             </span>
           )}
@@ -2416,14 +3048,14 @@ function Results({
         {/* Right: save error + status dropdown */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           {saveError && (
-            <span style={{ fontSize: 11, color: 'rgba(255,255,200,0.9)', fontFamily: "'Inter', sans-serif", animation: 'pulse 1s ease-in-out' }}>
-              ⚠ Not saved
+            <span style={{ fontSize: 11, color: 'rgba(255,255,200,0.9)', fontFamily: FONT_STACK, animation: 'pulse 1s ease-in-out' }}>
+              Not saved
             </span>
           )}
           <select
             value={dealStatus}
             onChange={e => onStatusChange(e.target.value)}
-            style={{ background: 'rgba(255,255,255,0.15)', border: '1px solid rgba(255,255,255,0.25)', color: '#fff', borderRadius: 5, padding: '4px 8px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: "'Inter', sans-serif", outline: 'none' }}
+            style={{ background: 'rgba(255,255,255,0.15)', border: '1px solid rgba(255,255,255,0.25)', color: '#fff', borderRadius: 5, padding: '4px 8px', fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK, outline: 'none' }}
           >
             <option style={{ background: '#913d3e', color: '#fff' }}>Active</option>
             <option style={{ background: '#913d3e', color: '#fff' }}>Worth Deeper Look</option>
@@ -2443,51 +3075,70 @@ function Results({
           collapsed={explorerCollapsed}
           onToggle={() => setExplorerCollapsed(c => !c)}
           onDocumentExtracted={onDocumentExtracted}
+          onRemoveDocument={onRemoveDocument}
           expandedWidth={explorerWidth}
         />
 
         {/* Drag divider: Explorer | PDF */}
         <DragDivider onDrag={handleExplorerDividerDrag} dark={true} />
 
-        {/* Center: PDF */}
+        {/* Center: Document viewer */}
         <div id="pdf-viewer-panel" style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
-          <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: '#ffffff', borderBottom: '1px solid #e5e7eb', fontSize: 11, fontFamily: 'Inter, sans-serif', color: '#6b7280' }}>
-            <button onClick={() => navigateTo(docState.currentPage - 1)} disabled={docState.currentPage <= 1}
-              style={{ background: 'none', border: 'none', cursor: docState.currentPage <= 1 ? 'default' : 'pointer', color: RED, fontWeight: 600, fontSize: 13, padding: '0 4px', opacity: docState.currentPage <= 1 ? 0.3 : 1 }}>←</button>
-            <span>Page {docState.currentPage}{docState.documents[docState.activeIndex]?.numPages ? ` of ${docState.documents[docState.activeIndex].numPages}` : ''}</span>
-            <button onClick={() => navigateTo(docState.currentPage + 1)}
-              disabled={!!(docState.documents[docState.activeIndex]?.numPages && docState.currentPage >= (docState.documents[docState.activeIndex].numPages ?? Infinity))}
-              style={{ background: 'none', border: 'none', cursor: (docState.documents[docState.activeIndex]?.numPages && docState.currentPage >= (docState.documents[docState.activeIndex].numPages ?? Infinity)) ? 'default' : 'pointer', color: RED, fontWeight: 600, fontSize: 13, padding: '0 4px', opacity: (docState.documents[docState.activeIndex]?.numPages && docState.currentPage >= (docState.documents[docState.activeIndex].numPages ?? Infinity)) ? 0.3 : 1 }}>→</button>
-          </div>
-          <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
-            {docState.documents[docState.activeIndex]?.url ? (
-              <PDFViewer
-                file={docState.documents[docState.activeIndex].url}
-                claims={claims}
-                activePage={activePage}
-                currentPage={docState.currentPage}
-                onPageChange={(p) => docDispatch({ type: 'SET_PAGE', payload: p })}
-                onNumPages={(n) => {
-                  docDispatch({ type: 'SET_NUM_PAGES', payload: n });
-                  if (pendingPageAfterSwitchRef.current !== null) {
-                    const targetPage = pendingPageAfterSwitchRef.current;
-                    pendingPageAfterSwitchRef.current = null;
-                    navigateToRef.current(targetPage);
-                  }
-                }}
-              />
-            ) : docState.documents.length > 0 ? (
-              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#3c3f41', gap: 10 }}>
-                <span style={{ fontSize: 28, opacity: 0.4 }}>📄</span>
-                <p style={{ color: '#9ca3af', fontSize: 13, fontFamily: 'Inter, sans-serif', margin: 0, textAlign: 'center', lineHeight: 1.5 }}>
-                  PDF not available
-                </p>
-                <p style={{ color: '#6b7280', fontSize: 11, fontFamily: 'Inter, sans-serif', margin: 0, textAlign: 'center' }}>
-                  Re-upload this document to view it.<br />Text content is still available for chat.
-                </p>
-              </div>
-            ) : null}
-          </div>
+          {(() => {
+            const activeDoc = docState.documents[docState.activeIndex];
+            const isPdf = !activeDoc || activeDoc.fileType === 'pdf';
+            return (
+              <>
+                {/* Pagination bar — only for PDFs */}
+                {isPdf && (
+                  <div style={{ flexShrink: 0, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 12px', background: '#ffffff', borderBottom: '1px solid #e5e7eb', fontSize: 11, fontFamily: FONT_STACK, color: '#6b7280' }}>
+                    <button onClick={() => navigateTo(docState.currentPage - 1)} disabled={docState.currentPage <= 1}
+                      style={{ background: 'none', border: 'none', cursor: docState.currentPage <= 1 ? 'default' : 'pointer', color: RED, fontWeight: 600, fontSize: 13, padding: '0 4px', opacity: docState.currentPage <= 1 ? 0.3 : 1 }}>←</button>
+                    <span>Page {docState.currentPage}{activeDoc?.numPages ? ` of ${activeDoc.numPages}` : ''}</span>
+                    <button onClick={() => navigateTo(docState.currentPage + 1)}
+                      disabled={!!(activeDoc?.numPages && docState.currentPage >= (activeDoc.numPages ?? Infinity))}
+                      style={{ background: 'none', border: 'none', cursor: (activeDoc?.numPages && docState.currentPage >= (activeDoc.numPages ?? Infinity)) ? 'default' : 'pointer', color: RED, fontWeight: 600, fontSize: 13, padding: '0 4px', opacity: (activeDoc?.numPages && docState.currentPage >= (activeDoc.numPages ?? Infinity)) ? 0.3 : 1 }}>→</button>
+                  </div>
+                )}
+
+                <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+                  {/* Excel viewer */}
+                  {activeDoc && activeDoc.fileType !== 'pdf' ? (
+                    activeDoc.url
+                      ? <ExcelViewer url={activeDoc.url} requestedSheet={requestedSheet} />
+                      : <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#f8f9fa' }}>
+                          <span style={{ fontSize: 12, color: '#9ca3af', fontFamily: FONT_STACK }}>Re-upload to view this spreadsheet.</span>
+                        </div>
+                  ) : activeDoc?.url ? (
+                    /* PDF viewer */
+                    <PDFViewer
+                      file={activeDoc.url}
+                      claims={claims}
+                      activePage={activePage}
+                      currentPage={docState.currentPage}
+                      onPageChange={(p) => docDispatch({ type: 'SET_PAGE', payload: p })}
+                      onNumPages={(n) => {
+                        docDispatch({ type: 'SET_NUM_PAGES', payload: n });
+                        if (pendingPageAfterSwitchRef.current !== null) {
+                          const targetPage = pendingPageAfterSwitchRef.current;
+                          pendingPageAfterSwitchRef.current = null;
+                          navigateToRef.current(targetPage);
+                        }
+                      }}
+                    />
+                  ) : docState.documents.length > 0 ? (
+                    <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: '#3c3f41', gap: 10 }}>
+                      <div style={{ fontSize: 10, fontWeight: 700, color: '#555', fontFamily: FONT_STACK, letterSpacing: '2px', opacity: 0.4 }}>PDF</div>
+                      <p style={{ color: '#9ca3af', fontSize: 13, fontFamily: FONT_STACK, margin: 0, textAlign: 'center', lineHeight: 1.5 }}>PDF not available</p>
+                      <p style={{ color: '#6b7280', fontSize: 11, fontFamily: FONT_STACK, margin: 0, textAlign: 'center' }}>
+                        Re-upload this document to view it.<br />Text content is still available for chat.
+                      </p>
+                    </div>
+                  ) : null}
+                </div>
+              </>
+            );
+          })()}
         </div>
 
         {/* Drag divider: PDF | Analysis */}
@@ -2499,14 +3150,14 @@ function Results({
           {/* Panel header — company name + verdict pill + actions */}
           <div style={{ height: 48, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 16px', background: '#fff', borderBottom: '1px solid #e5e7eb', flexShrink: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flex: 1, overflow: 'hidden' }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: '#1a1a1a', fontFamily: 'Inter, sans-serif', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: '#1a1a1a', fontFamily: FONT_STACK, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {companyName}
               </span>
-              <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 4, background: overallCfg.bg, color: overallCfg.color, border: `1px solid ${overallCfg.color}40`, fontFamily: 'Inter, sans-serif', letterSpacing: '0.5px', whiteSpace: 'nowrap', flexShrink: 0 }}>
+              <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 4, background: overallCfg.bg, color: overallCfg.color, border: `1px solid ${overallCfg.color}40`, fontFamily: FONT_STACK, letterSpacing: '0.5px', whiteSpace: 'nowrap', flexShrink: 0 }}>
                 {assessment.overall_verdict.toUpperCase()}
               </span>
               {dealScore > 0 && (
-                <span style={{ fontSize: 11, fontWeight: 600, color: dealScoreColor, fontFamily: 'Inter, sans-serif', flexShrink: 0 }}>{dealScore}/10</span>
+                <span style={{ fontSize: 11, fontWeight: 600, color: dealScoreColor, fontFamily: FONT_STACK, flexShrink: 0 }}>{dealScore}/10</span>
               )}
             </div>
             <div style={{ display: 'flex', gap: 6, flexShrink: 0, marginLeft: 8 }}>
@@ -2529,7 +3180,7 @@ function Results({
               }
               return (
                 <button key={tab} onClick={() => setActiveTab(tab)} style={{
-                  padding: '0 13px 10px 13px', fontFamily: 'Inter, sans-serif', fontSize: 11, fontWeight: 600,
+                  padding: '0 13px 10px 13px', fontFamily: FONT_STACK, fontSize: 11, fontWeight: 600,
                   letterSpacing: '1px', textTransform: 'uppercase', cursor: 'pointer',
                   color: activeTab === tab ? RED : '#6b7280',
                   border: 'none', borderBottom: activeTab === tab ? `2px solid ${RED}` : '2px solid transparent',
@@ -2546,81 +3197,127 @@ function Results({
 
             {/* ── OVERVIEW TAB ── */}
             {activeTab === 'overview' && (
-              <div style={{ flex: 1, overflowY: 'auto', background: OFFWHITE }}>
-                {/* Verdict + stats */}
-                <div style={{ background: '#fff', padding: '14px 16px', borderBottom: '1px solid #e5e7eb' }}>
-                  <p style={{ margin: '0 0 8px', ...sectionLabel }}>FIRST-PASS VERDICT</p>
-                  <div style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12 }}>
-                    <span style={{ fontSize: 11, fontWeight: 700, padding: '3px 10px', borderRadius: 4, background: overallCfg.bg, color: overallCfg.color, border: `1px solid ${overallCfg.color}40`, fontFamily: 'Inter, sans-serif', flexShrink: 0 }}>
-                      {assessment.overall_verdict.toUpperCase()}
-                    </span>
-                    <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: 'Inter, sans-serif' }}>{assessment.reasoning}</p>
-                  </div>
-                  <div style={{ display: 'flex', gap: 6 }}>
-                    {[
-                      { label: 'VERIFIED', count: stats.verified, color: '#166534', bg: '#f0fdf4', border: '#bbf7d0' },
-                      { label: 'DISPUTED', count: stats.disputed, color: '#92400e', bg: '#fffbeb', border: '#fde68a' },
-                      { label: 'ASK MGMT', count: stats.unverifiable, color: '#991b1b', bg: '#fdf2f2', border: '#fecaca' },
-                    ].map(s => (
-                      <div key={s.label} style={{ flex: 1, textAlign: 'center', padding: '6px 8px', background: s.bg, border: `1px solid ${s.border}`, borderRadius: 4 }}>
-                        <div style={{ fontSize: 20, fontWeight: 700, color: s.color, fontFamily: 'Inter, sans-serif', lineHeight: 1 }}>{s.count}</div>
-                        <div style={{ fontSize: 9, fontWeight: 700, color: s.color, fontFamily: 'Inter, sans-serif', marginTop: 3, letterSpacing: '0.5px' }}>{s.label}</div>
-                      </div>
-                    ))}
-                  </div>
+              <div style={{ flex: 1, overflowY: 'auto', background: '#fff' }}>
+
+                {/* Verdict */}
+                <div style={{ padding: '20px 20px 16px', borderBottom: '1px solid #e5e7eb' }}>
+                  <p style={{ ...sectionLabel, margin: '0 0 10px' }}>FIRST-PASS VERDICT</p>
+                  <p style={{ margin: '0 0 6px', fontFamily: FONT_STACK, fontSize: 26, fontWeight: 700, color: overallCfg.color, lineHeight: 1.15, letterSpacing: '-0.3px' }}>
+                    {assessment.overall_verdict}
+                  </p>
+                  <p style={{ margin: '0 0 10px', fontSize: 13, color: '#374151', lineHeight: 1.55, fontFamily: FONT_STACK }}>
+                    {assessment.reasoning}
+                  </p>
                   {assessment.criteria_fit && (
-                    <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ fontSize: 11, fontWeight: 600, padding: '2px 8px', borderRadius: 4, background: assessment.criteria_fit.fits ? '#f0fdf4' : '#fdf2f2', color: assessment.criteria_fit.fits ? '#166534' : '#991b1b', border: `1px solid ${assessment.criteria_fit.fits ? '#bbf7d0' : '#fecaca'}`, fontFamily: 'Inter, sans-serif' }}>
-                        {assessment.criteria_fit.fits ? 'Fits criteria' : 'Outside criteria'}
-                      </span>
-                      <span style={{ fontSize: 11, color: '#6b7280', fontFamily: 'Inter, sans-serif' }}>{assessment.criteria_fit.explanation}</span>
-                    </div>
+                    <p style={{ margin: 0, fontSize: 11, fontFamily: FONT_STACK, color: assessment.criteria_fit.fits ? '#166534' : '#991b1b' }}>
+                      {assessment.criteria_fit.fits ? '✓ Fits' : '✗ Outside'} investment criteria — {assessment.criteria_fit.explanation}
+                    </p>
                   )}
                 </div>
 
-                {/* Company snapshot */}
-                {assessment.company_snapshot && (
-                  <div style={{ background: '#fff', padding: '12px 16px', borderBottom: '1px solid #e5e7eb', marginTop: 6 }}>
-                    <p style={{ margin: '0 0 6px', ...sectionLabel }}>COMPANY</p>
-                    <p style={{ margin: 0, fontSize: 13, color: '#374151', lineHeight: 1.6, fontFamily: 'Inter, sans-serif' }}>{assessment.company_snapshot}</p>
+                {/* Company + Deal Metrics */}
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', borderBottom: '1px solid #e5e7eb' }}>
+                  <div style={{ padding: '14px 16px', borderRight: '1px solid #e5e7eb' }}>
+                    <p style={{ ...sectionLabel, margin: '0 0 8px' }}>COMPANY</p>
+                    <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.6, fontFamily: FONT_STACK }}>
+                      {assessment.company_snapshot}
+                    </p>
                   </div>
-                )}
+                  <div style={{ padding: '14px 16px' }}>
+                    <p style={{ ...sectionLabel, margin: '0 0 8px' }}>DEAL METRICS</p>
+                    {compsData?.deal_profile ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+                        {([
+                          { label: 'Revenue', value: compsData.deal_profile.revenue_millions ? `$${compsData.deal_profile.revenue_millions}M` : null },
+                          { label: 'EBITDA', value: compsData.deal_profile.ebitda_millions ? `$${compsData.deal_profile.ebitda_millions}M` : null },
+                          { label: 'Margin', value: compsData.deal_profile.ebitda_margin_pct ? `${compsData.deal_profile.ebitda_margin_pct}%` : null },
+                          { label: 'Sector', value: compsData.deal_profile.sector ?? null },
+                          { label: 'Geography', value: compsData.deal_profile.geography ?? null },
+                        ] as { label: string; value: string | null }[]).filter(m => m.value).map(m => (
+                          <div
+                            key={m.label}
+                            style={{
+                              display: 'flex',
+                              justifyContent: 'flex-start',
+                              alignItems: 'flex-start',
+                              gap: 12,
+                              borderBottom: '1px solid #f3f4f6',
+                              paddingBottom: 5,
+                            }}
+                          >
+                            <span
+                              style={{
+                                fontSize: 11,
+                                color: '#9ca3af',
+                                fontFamily: FONT_STACK,
+                                flexShrink: 0,
+                                minWidth: 82,
+                              }}
+                            >
+                              {m.label}
+                            </span>
+                            <span
+                              style={{
+                                fontSize: 13,
+                                fontWeight: 600,
+                                color: NAVY,
+                                fontFamily: FONT_STACK,
+                                flex: 1,
+                                minWidth: 0,
+                                whiteSpace: 'normal',
+                                overflowWrap: 'anywhere',
+                                wordBreak: 'break-word',
+                              }}
+                            >
+                              {m.value}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p style={{ fontSize: 11, color: '#9ca3af', fontFamily: FONT_STACK, margin: 0 }}>
+                        {compsLoading ? 'Loading metrics…' : 'Run COMPS to populate deal metrics.'}
+                      </p>
+                    )}
+                  </div>
+                </div>
 
                 {/* Seller narrative */}
                 {assessment.sellers_narrative && (
-                  <div style={{ background: '#fff', padding: '12px 16px', borderBottom: '1px solid #e5e7eb' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                  <div style={{ padding: '14px 16px', borderBottom: '1px solid #e5e7eb' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
                       <p style={{ margin: 0, ...sectionLabel }}>SELLER NARRATIVE</p>
                       {assessment.narrative_holds_up && (
-                        <span style={{ fontSize: 11, fontWeight: 600, color: assessment.narrative_holds_up.holds ? '#166534' : '#991b1b', fontFamily: 'Inter, sans-serif' }}>
+                        <span style={{ fontSize: 11, fontWeight: 600, color: assessment.narrative_holds_up.holds ? '#166534' : '#991b1b', fontFamily: FONT_STACK }}>
                           {assessment.narrative_holds_up.holds ? 'Holds up' : 'Does not hold'}
                         </span>
                       )}
                     </div>
-                    <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: 'Inter, sans-serif', borderLeft: '2px solid #e5e7eb', paddingLeft: 10 }}>{assessment.sellers_narrative}</p>
+                    <p style={{ margin: '0 0 6px', fontSize: 12, color: '#374151', lineHeight: 1.6, fontFamily: FONT_STACK, borderLeft: '2px solid #e5e7eb', paddingLeft: 12 }}>
+                      {assessment.sellers_narrative}
+                    </p>
                     {assessment.narrative_holds_up?.explanation && (
-                      <p style={{ margin: '6px 0 0', fontSize: 11, color: '#6b7280', fontFamily: 'Inter, sans-serif' }}>{assessment.narrative_holds_up.explanation}</p>
+                      <p style={{ margin: 0, fontSize: 11, color: '#6b7280', fontFamily: FONT_STACK }}>{assessment.narrative_holds_up.explanation}</p>
                     )}
                   </div>
                 )}
 
-                {/* Risks + Bull case two-column */}
+                {/* Risks + Bull Case */}
                 {(assessment.top_risks?.length > 0 || assessment.bull_case) && (
-                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, padding: '6px', marginTop: 6 }}>
-                    <div style={{ background: '#fff', padding: '12px', borderRadius: 6, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(0,0,0,0.06)' }}>
-                      <p style={{ margin: '0 0 8px', ...sectionLabel }}>RISKS</p>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', borderBottom: '1px solid #e5e7eb' }}>
+                    <div style={{ padding: '14px 16px', borderRight: '1px solid #e5e7eb' }}>
+                      <p style={{ ...sectionLabel, margin: '0 0 12px' }}>RISKS</p>
                       {assessment.top_risks?.map((risk, i) => (
-                        <div key={i} style={{ borderLeft: '2px solid #dc2626', paddingLeft: 8, marginBottom: 6 }}>
-                          <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.4, fontFamily: 'Inter, sans-serif' }}>{risk}</p>
+                        <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 8, paddingBottom: 8, borderBottom: i < (assessment.top_risks.length - 1) ? '1px solid #f3f4f6' : 'none' }}>
+                          <span style={{ fontSize: 11, fontWeight: 700, color: '#dc2626', flexShrink: 0, fontFamily: FONT_STACK, minWidth: 16 }}>{i + 1}.</span>
+                          <p style={{ margin: 0, fontSize: 12, color: '#dc2626', lineHeight: 1.5, fontFamily: FONT_STACK }}>{risk}</p>
                         </div>
                       ))}
                     </div>
-                    <div style={{ background: '#fff', padding: '12px', borderRadius: 6, border: '1px solid #e5e7eb', boxShadow: '0 1px 2px rgba(0,0,0,0.06)' }}>
-                      <p style={{ margin: '0 0 8px', ...sectionLabel, color: '#16a34a' }}>BULL CASE</p>
+                    <div style={{ padding: '14px 16px' }}>
+                      <p style={{ ...sectionLabel, margin: '0 0 12px', color: '#16a34a' }}>BULL CASE</p>
                       {assessment.bull_case && (
-                        <div style={{ borderLeft: '2px solid #16a34a', paddingLeft: 8 }}>
-                          <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.4, fontFamily: 'Inter, sans-serif' }}>{assessment.bull_case}</p>
-                        </div>
+                        <p style={{ margin: 0, fontSize: 12, color: '#16a34a', lineHeight: 1.6, fontFamily: FONT_STACK }}>{assessment.bull_case}</p>
                       )}
                     </div>
                   </div>
@@ -2628,19 +3325,33 @@ function Results({
 
                 {/* Key questions */}
                 {assessment.key_questions?.length > 0 && (
-                  <div style={{ background: '#fff', padding: '12px 16px', margin: '6px 0', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
-                    <p style={{ margin: '0 0 8px', ...sectionLabel }}>MUST ANSWER</p>
+                  <div style={{ padding: '14px 16px', borderBottom: '1px solid #e5e7eb' }}>
+                    <p style={{ ...sectionLabel, margin: '0 0 12px' }}>KEY QUESTIONS FOR MANAGEMENT</p>
                     {assessment.key_questions.map((q, i) => (
-                      <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 5 }}>
-                        <span style={{ fontSize: 11, fontWeight: 700, color: RED, flexShrink: 0, fontFamily: 'Inter, sans-serif' }}>{i + 1}.</span>
-                        <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: 'Inter, sans-serif' }}>{q}</p>
+                      <div key={i} style={{ display: 'flex', gap: 10, marginBottom: 8, paddingBottom: 8, borderBottom: i < (assessment.key_questions.length - 1) ? '1px solid #f3f4f6' : 'none' }}>
+                        <span style={{ fontSize: 11, fontWeight: 700, color: RED, flexShrink: 0, fontFamily: FONT_STACK, minWidth: 16 }}>{i + 1}.</span>
+                        <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: FONT_STACK }}>{q}</p>
                       </div>
                     ))}
                   </div>
                 )}
 
-                {/* Charts */}
-                {chartsData && <ChartsSection chartsData={chartsData} />}
+                {/* Diligence checklist */}
+                {claims.filter(c => c.diligence_question).length > 0 && (
+                  <div style={{ padding: '14px 16px', borderBottom: '1px solid #e5e7eb' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+                      <p style={{ margin: 0, ...sectionLabel }}>DILIGENCE CHECKLIST</p>
+                      <button onClick={copyDiligenceQuestions} style={{ background: 'none', border: '1px solid #e5e7eb', borderRadius: 4, padding: '3px 10px', fontSize: 10, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK, color: '#374151' }}>Copy all</button>
+                    </div>
+                    {claims.filter(c => c.diligence_question).map((c, i) => (
+                      <div key={i} style={{ display: 'flex', gap: 10, marginBottom: 8, alignItems: 'flex-start', paddingBottom: 8, borderBottom: '1px solid #f3f4f6' }}>
+                        <input type="checkbox" style={{ marginTop: 2, flexShrink: 0, accentColor: RED }} onClick={e => e.stopPropagation()} />
+                        <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: FONT_STACK }}>{c.diligence_question}</p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
               </div>
             )}
 
@@ -2648,78 +3359,64 @@ function Results({
             {activeTab === 'claims' && (
               <div style={{ flex: 1, overflowY: 'auto', background: OFFWHITE }}>
                 {/* Filter row */}
-                <div style={{ background: '#fff', padding: '10px 16px', borderBottom: '1px solid #e5e7eb', display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }}>
-                  <span style={{ fontSize: 10, color: '#9ca3af', fontFamily: 'Inter, sans-serif', marginRight: 4 }}>{claims.length} claims</span>
+                <div style={{ background: '#fff', padding: '0 16px', borderBottom: '1px solid #e5e7eb', display: 'flex', gap: 0, alignItems: 'flex-end' }}>
+                  <span style={{ fontSize: 10, color: '#9ca3af', fontFamily: FONT_STACK, marginRight: 8, paddingBottom: 10 }}>{claims.length} claims</span>
                   {(["all", "disputed", "unverifiable", "verified"] as ClaimFilter[]).map(tab => (
                     <button key={tab} onClick={() => setClaimFilter(tab)} style={{
-                      padding: '3px 9px', fontSize: 10, fontWeight: 600, letterSpacing: '0.5px',
-                      textTransform: 'uppercase', cursor: 'pointer', fontFamily: 'Inter, sans-serif', borderRadius: 4,
-                      background: claimFilter === tab ? RED : 'transparent',
-                      color: claimFilter === tab ? '#fff' : '#6b7280',
-                      border: `1px solid ${claimFilter === tab ? RED : '#e5e7eb'}`,
+                      padding: '0 10px 8px', fontFamily: FONT_STACK, fontSize: 10, fontWeight: 700,
+                      letterSpacing: '1px', textTransform: 'uppercase' as const, cursor: 'pointer',
+                      color: claimFilter === tab ? NAVY : '#9ca3af',
+                      border: 'none', borderBottom: claimFilter === tab ? `2px solid ${NAVY}` : '2px solid transparent',
+                      background: 'transparent',
                     }}>
                       {tab === 'unverifiable' ? 'Ask Mgmt' : tab.charAt(0).toUpperCase() + tab.slice(1)}
-                      {tab !== 'all' && <span style={{ marginLeft: 3, opacity: 0.7 }}>({claims.filter(c => c.verdict === tab).length})</span>}
+                      {tab !== 'all' && <span style={{ marginLeft: 3 }}>({claims.filter(c => c.verdict === tab).length})</span>}
                     </button>
                   ))}
                 </div>
-                <div style={{ padding: '8px 12px' }}>
+                <div style={{ background: '#fff' }}>
                   {filteredClaims.length === 0 ? (
-                    <p style={{ fontSize: 12, color: '#9ca3af', textAlign: 'center', padding: '20px 0', fontFamily: 'Inter, sans-serif' }}>No claims in this category.</p>
+                    <p style={{ fontSize: 12, color: '#9ca3af', textAlign: 'center', padding: '20px 0', fontFamily: FONT_STACK }}>No claims in this category.</p>
                   ) : filteredClaims.map(claim => {
                     const idx = claims.indexOf(claim);
                     return <ClaimCard key={claim.id ?? idx} claim={claim} index={idx} isActive={activeClaim === idx} onClick={() => setActiveClaim(activeClaim === idx ? null : idx)} />;
                   })}
                 </div>
-                {claims.filter(c => c.diligence_question).length > 0 && (
-                  <div style={{ background: '#fff', margin: '6px 0', padding: '12px 16px', borderTop: '1px solid #e5e7eb', borderBottom: '1px solid #e5e7eb' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-                      <p style={{ margin: 0, ...sectionLabel }}>DILIGENCE CHECKLIST</p>
-                      <button onClick={copyDiligenceQuestions} style={{ background: RED, color: '#fff', border: 'none', borderRadius: 4, padding: '3px 8px', fontSize: 10, fontWeight: 600, cursor: 'pointer', fontFamily: 'Inter, sans-serif' }}>Copy all</button>
-                    </div>
-                    {claims.filter(c => c.diligence_question).map((c, i) => (
-                      <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 6, alignItems: 'flex-start' }}>
-                        <span style={{ flexShrink: 0, width: 16, height: 16, borderRadius: '50%', background: RED, color: '#fff', fontSize: 9, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', marginTop: 1 }}>{i + 1}</span>
-                        <p style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: 'Inter, sans-serif' }}>{c.diligence_question}</p>
-                      </div>
-                    ))}
-                  </div>
-                )}
               </div>
             )}
 
             {/* ── CONFLICTS TAB ── */}
             {activeTab === 'conflicts' && (
-              <div style={{ flex: 1, overflowY: 'auto', background: OFFWHITE }}>
+              <div style={{ flex: 1, overflowY: 'auto', background: '#fff' }}>
                 {conflicts.length === 0 ? (
-                  <div style={{ textAlign: 'center', padding: '48px 20px', color: '#6b7280', fontSize: 13, fontFamily: 'Inter, sans-serif' }}>
+                  <div style={{ textAlign: 'center', padding: '48px 20px', color: '#6b7280', fontSize: 13, fontFamily: FONT_STACK }}>
                     No cross-document conflicts detected.
                   </div>
                 ) : (
-                  <div style={{ padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    {conflicts.map((c, i) => {
-                      const sev = severityConfig[c.severity] ?? severityConfig.low;
-                      return (
-                        <div key={i} style={{ background: '#fff', borderRadius: 6, border: '1px solid #e5e7eb', overflow: 'hidden', boxShadow: '0 1px 2px rgba(0,0,0,0.06)' }}>
-                          <div style={{ borderLeft: `3px solid ${sev.color}`, padding: '10px 12px' }}>
-                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                              <span style={{ fontSize: 10, color: '#6b7280', fontWeight: 600, fontFamily: 'Inter, sans-serif' }}>{c.doc1} vs {c.doc2}</span>
-                              <span style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.5px', color: sev.color, background: sev.bg, border: `1px solid ${sev.border}`, borderRadius: 3, padding: '1px 6px', fontFamily: 'Inter, sans-serif' }}>{sev.label}</span>
+                  conflicts.map((c, i) => {
+                    const sev = severityConfig[c.severity] ?? severityConfig.low;
+                    const borderColor = c.severity === 'high' ? '#dc2626' : c.severity === 'medium' ? '#d97706' : '#9ca3af';
+                    return (
+                      <div key={i} style={{ borderLeft: `3px solid ${borderColor}`, borderBottom: '1px solid #e5e7eb', padding: '14px 16px 14px 14px' }}>
+                        <p style={{ margin: '0 0 10px', fontSize: 10, fontWeight: 700, color: borderColor, fontFamily: FONT_STACK, textTransform: 'uppercase', letterSpacing: '1px' }}>
+                          {sev.label} Severity
+                        </p>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 10 }}>
+                          {([{ label: c.doc1, text: c.claim1 }, { label: c.doc2, text: c.claim2 }]).map((side, j) => (
+                            <div key={j}>
+                              <p style={{ margin: '0 0 4px', fontSize: 10, fontWeight: 700, color: '#9ca3af', textTransform: 'uppercase', fontFamily: FONT_STACK, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{side.label}</p>
+                              <div style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: FONT_STACK, fontStyle: 'italic' }}
+                                dangerouslySetInnerHTML={{ __html: '"' + formatCitations(side.text) + '"' }} />
                             </div>
-                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 8 }}>
-                              {[{ label: c.doc1, text: c.claim1 }, { label: c.doc2, text: c.claim2 }].map((side, j) => (
-                                <div key={j} style={{ background: '#f8f6f3', borderRadius: 4, padding: '6px 8px', border: '1px solid #e5e7eb' }}>
-                                  <p style={{ margin: '0 0 2px', fontSize: 9, fontWeight: 700, color: '#6b7280', textTransform: 'uppercase', fontFamily: 'Inter, sans-serif' }}>{side.label}</p>
-                                  <p style={{ margin: 0, fontSize: 11, color: '#374151', lineHeight: 1.4, fontFamily: 'Inter, sans-serif' }}>{side.text}</p>
-                                </div>
-                              ))}
-                            </div>
-                            <p style={{ margin: 0, fontSize: 11, color: sev.color, fontWeight: 500, fontFamily: 'Inter, sans-serif' }}>{c.explanation}</p>
-                          </div>
+                          ))}
                         </div>
-                      );
-                    })}
-                  </div>
+                        <div style={{ borderTop: '1px solid #e5e7eb', paddingTop: 8 }}>
+                          <div style={{ margin: 0, fontSize: 12, color: '#374151', lineHeight: 1.5, fontFamily: FONT_STACK }}
+                            dangerouslySetInnerHTML={{ __html: formatCitations(c.explanation) }} />
+                        </div>
+                      </div>
+                    );
+                  })
                 )}
               </div>
             )}
@@ -2737,7 +3434,7 @@ function Results({
                 {/* Message history */}
                 <div style={{ flex: 1, overflowY: 'auto', padding: '12px 12px 4px' }}>
                   {chatMessages.length === 0 && (
-                    <div style={{ textAlign: 'center', padding: '48px 20px', color: '#9ca3af', fontSize: 13, fontFamily: 'Inter, sans-serif' }}>
+                    <div style={{ textAlign: 'center', padding: '48px 20px', color: '#9ca3af', fontSize: 13, fontFamily: FONT_STACK }}>
                       Ask anything about this deal
                     </div>
                   )}
@@ -2746,27 +3443,26 @@ function Results({
                       <div key={i} style={{ display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
                         {msg.role === 'user' ? (
                           <div style={{ maxWidth: '75%' }}>
-                            <div style={{ background: RED, color: '#fff', borderRadius: '12px 12px 2px 12px', padding: '8px 12px', fontSize: 13, fontFamily: 'Inter, sans-serif', lineHeight: 1.5 }}>
+                            <div style={{ background: RED, color: '#fff', borderRadius: '12px 12px 2px 12px', padding: '8px 12px', fontSize: 13, fontFamily: FONT_STACK, lineHeight: 1.5 }}>
                               {msg.content}
                             </div>
-                            {msg.timestamp && <div style={{ fontSize: 10, color: '#9ca3af', textAlign: 'right', marginTop: 3, fontFamily: 'Inter, sans-serif' }}>{msg.timestamp}</div>}
+                            {msg.timestamp && <div style={{ fontSize: 10, color: '#9ca3af', textAlign: 'right', marginTop: 3, fontFamily: FONT_STACK }}>{msg.timestamp}</div>}
                           </div>
                         ) : (
                           <div style={{ maxWidth: msg.segments?.some(s => s.type === 'chart') ? '100%' : '92%' }}>
                             <div style={{ borderLeft: '2px solid #e5e7eb', paddingLeft: 12, marginLeft: 4 }}>
-                              {msg.segments ? (
-                                msg.segments.map((segment, si) =>
-                                  segment.type === 'chart' ? (
-                                    <ChartRenderer key={si} chartData={segment.chartData} />
-                                  ) : (
-                                    <div key={si} dangerouslySetInnerHTML={{ __html: formatCitations(segment.content) }} />
-                                  )
+                              {(msg.segments && msg.segments.length > 0
+                                ? msg.segments
+                                : parseResponseSegments(msg.content)
+                              ).map((segment, si) =>
+                                segment.type === 'chart' ? (
+                                  <ChartRenderer key={si} chartData={segment.chartData} />
+                                ) : (
+                                  <div key={si} dangerouslySetInnerHTML={{ __html: formatCitations(segment.content) }} />
                                 )
-                              ) : (
-                                <div dangerouslySetInnerHTML={{ __html: formatCitations(msg.content) }} />
                               )}
                             </div>
-                            {msg.timestamp && <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 3, marginLeft: 16, fontFamily: 'Inter, sans-serif' }}>{msg.timestamp}</div>}
+                            {msg.timestamp && <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 3, marginLeft: 16, fontFamily: FONT_STACK }}>{msg.timestamp}</div>}
                           </div>
                         )}
                       </div>
@@ -2799,7 +3495,7 @@ function Results({
                     'Where are the contradictions between documents?',
                   ].map((q, i) => (
                     <button key={i} onClick={() => { setChatInput(q); chatInputRef.current?.focus(); }}
-                      style={{ padding: '4px 10px', background: '#fff', border: '1px solid #e5e7eb', borderRadius: 4, fontSize: 11, fontFamily: 'Inter, sans-serif', fontWeight: 500, color: '#374151', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>
+                      style={{ padding: '4px 10px', background: '#fff', border: '1px solid #e5e7eb', borderRadius: 4, fontSize: 11, fontFamily: FONT_STACK, fontWeight: 500, color: '#374151', cursor: 'pointer', whiteSpace: 'nowrap', flexShrink: 0 }}>
                       {q}
                     </button>
                   ))}
@@ -2808,7 +3504,7 @@ function Results({
                 {/* Input row */}
                 <div style={{ display: 'flex', gap: 8, padding: '10px 12px', borderTop: '1px solid #e5e7eb', background: '#fff', flexShrink: 0, alignItems: 'center' }}>
                   {chatMessages.length > 0 && (
-                    <button onClick={() => setChatMessages([])} style={{ background: 'none', border: 'none', fontSize: 10, color: '#9ca3af', cursor: 'pointer', fontFamily: 'Inter, sans-serif', flexShrink: 0, padding: 0 }}>Clear</button>
+                    <button onClick={() => setChatMessages([])} style={{ background: 'none', border: 'none', fontSize: 10, color: '#9ca3af', cursor: 'pointer', fontFamily: FONT_STACK, flexShrink: 0, padding: 0 }}>Clear</button>
                   )}
                   <input
                     ref={chatInputRef}
@@ -2817,11 +3513,11 @@ function Results({
                     onChange={e => setChatInput(e.target.value)}
                     onKeyDown={e => { if (e.key === 'Enter') sendChatMessage(); }}
                     placeholder="Ask anything about this deal..."
-                    style={{ flex: 1, padding: '8px 12px', border: '1px solid #e5e7eb', borderRadius: 6, fontSize: 13, fontFamily: 'Inter, sans-serif', outline: 'none', color: '#1a1a1a' }}
+                    style={{ flex: 1, padding: '8px 12px', border: '1px solid #e5e7eb', borderRadius: 6, fontSize: 13, fontFamily: FONT_STACK, outline: 'none', color: '#1a1a1a' }}
                     disabled={chatLoading}
                   />
                   <button onClick={sendChatMessage} disabled={chatLoading || !chatInput.trim()}
-                    style={{ padding: '8px 16px', background: RED, color: '#fff', border: 'none', borderRadius: 6, fontSize: 12, fontWeight: 600, fontFamily: 'Inter, sans-serif', cursor: chatLoading || !chatInput.trim() ? 'not-allowed' : 'pointer', opacity: chatLoading || !chatInput.trim() ? 0.55 : 1 }}>
+                    style={{ padding: '8px 16px', background: RED, color: '#fff', border: 'none', borderRadius: 6, fontSize: 12, fontWeight: 600, fontFamily: FONT_STACK, cursor: chatLoading || !chatInput.trim() ? 'not-allowed' : 'pointer', opacity: chatLoading || !chatInput.trim() ? 0.55 : 1 }}>
                     Send
                   </button>
                 </div>
@@ -2840,7 +3536,7 @@ export default function App() {
   // Persistence
   const {
     loadDeals, loadDeal, createDeal, saveDeal,
-    saveDocument, saveAnalysis, saveChatMessage, deleteDeal, saveError,
+    saveDocument, deleteDocument, saveAnalysis, saveChatMessage, deleteDeal, saveError,
   } = useDealPersistence();
 
   // ── View routing ─────────────────────────────────────────────
@@ -2911,7 +3607,8 @@ export default function App() {
   // ── Home screen actions ──────────────────────────────────────
   const handleNewDeal = () => setShowNewDealModal(true);
 
-  const handleCreateDeal = async (name: string, dealSector: string) => {
+  const handleCreateDeal = async (name: string) => {
+    const dealSector = "Private Equity";
     setShowNewDealModal(false);
     console.log('[Deal] Creating deal:', { name, dealSector, supabaseConfigured: isSupabaseConfigured });
     const deal = await createDeal(name, dealSector);
@@ -3049,6 +3746,23 @@ export default function App() {
     if (activeDealId) await saveDocument(activeDealId, filename, fileType, text);
   }, [activeDealId, saveDocument]);
 
+  const handleRemoveDocument = useCallback(async (filename: string) => {
+    // 1. Remove from Supabase
+    if (activeDealId) await deleteDocument(activeDealId, filename);
+    // 2. Remove from uploadedFiles state (drives the viewer)
+    setUploadedFiles(prev => {
+      const updated = prev.filter(f => f.name !== filename);
+      // 3. Re-save the updated file list to IndexedDB so it's gone on next reload
+      if (activeDealId) {
+        saveFilesToIDB(activeDealId, updated);
+        dealFilesCache.current.set(activeDealId, updated);
+      }
+      return updated;
+    });
+    // 4. Also remove from savedDocEntries in case IDB was empty (DB-only path)
+    setSavedDocEntries(prev => prev.filter(d => d.name !== filename));
+  }, [activeDealId, deleteDocument]);
+
   // ── File staging ─────────────────────────────────────────────
   const handleAddFiles = useCallback((incoming: File[]) => {
     setStagedFiles(prev => {
@@ -3059,6 +3773,15 @@ export default function App() {
 
   const handleRemoveFile = useCallback((i: number) => {
     setStagedFiles(prev => prev.filter((_, j) => j !== i));
+  }, []);
+
+  const handleSetPrimary = useCallback((i: number) => {
+    setStagedFiles(prev => {
+      const next = [...prev];
+      const [file] = next.splice(i, 1);
+      next.unshift(file);
+      return next;
+    });
   }, []);
 
   // ── Comps fetch ───────────────────────────────────────────────
@@ -3179,7 +3902,7 @@ export default function App() {
       <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', background: OFFWHITE, gap: 16 }}>
         <style>{GLOBAL_STYLE}</style>
         <div style={{ width: 36, height: 36, border: `3px solid #e5e7eb`, borderTop: `3px solid ${RED}`, borderRadius: '50%', animation: 'spin 1s linear infinite' }} />
-        <p style={{ color: '#6b7280', fontSize: 13, fontFamily: "'Inter', sans-serif" }}>Loading deal…</p>
+        <p style={{ color: '#6b7280', fontSize: 13, fontFamily: FONT_STACK }}>Loading deal…</p>
       </div>
     );
   }
@@ -3207,6 +3930,8 @@ export default function App() {
         saveError={saveError}
         onBackToHome={handleBackToHome}
         onDocumentExtracted={handleDocumentExtracted}
+        onRemoveDocument={handleRemoveDocument}
+        sector={sector}
       />
     );
   }
@@ -3216,6 +3941,7 @@ export default function App() {
       files={stagedFiles}
       onAddFiles={handleAddFiles}
       onRemoveFile={handleRemoveFile}
+      onSetPrimary={handleSetPrimary}
       onAnalyze={handleAnalyze}
       loading={loading}
       loadingStep={loadingStep}

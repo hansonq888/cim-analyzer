@@ -205,6 +205,17 @@ export function useDealPersistence() {
     });
   }, [safe]);
 
+  const deleteDocument = useCallback(async (dealId: string, filename: string) => {
+    await safe(async () => {
+      const { error } = await supabase!
+        .from('deal_documents')
+        .delete()
+        .eq('deal_id', dealId)
+        .eq('filename', filename);
+      if (error) throw error;
+    });
+  }, [safe]);
+
   const deleteDeal = useCallback(async (dealId: string) => {
     await safe(async () => {
       // Delete child rows first (FK constraints), then the deal itself
@@ -244,6 +255,7 @@ export function useDealPersistence() {
     createDeal,
     saveDeal,
     saveDocument,
+    deleteDocument,
     saveAnalysis,
     saveChatMessage,
     deleteDeal,

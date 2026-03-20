@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 pdfplumber
+openpyxl
 python-multipart
 anthropic
 requests
