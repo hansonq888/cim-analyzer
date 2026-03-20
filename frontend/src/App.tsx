@@ -2880,6 +2880,14 @@ export default function App() {
   // Cache uploaded File objects by deal ID so PDFs survive back-navigation within the session
   const dealFilesCache = useRef<Map<string, File[]>>(new Map());
 
+  // ── Keep-alive ping to prevent Render cold starts ────────────
+  useEffect(() => {
+    const ping = () => fetch(`${API_BASE_URL}/health`).catch(() => {});
+    ping();
+    const interval = setInterval(ping, 8 * 60 * 1000); // every 8 min
+    return () => clearInterval(interval);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Load deals on mount ──────────────────────────────────────
   useEffect(() => {
     loadDeals().then(d => { setDeals(d); setDealsLoading(false); });

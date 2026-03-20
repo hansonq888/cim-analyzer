@@ -8,6 +8,9 @@ import json
 import io
 import os
 import re
+import time
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
@@ -208,7 +211,7 @@ def extract_claims(text: str, sector: str, criteria_context: str = "") -> list:
 
     prompt = (
         f"You are a senior {sector} analyst doing a first-pass on a CIM.\n\n"
-        "Extract the 8-10 MOST IMPACTFUL verifiable claims — the ones that would actually change whether you pursue this deal.\n\n"
+        "Extract the 6 MOST IMPACTFUL verifiable claims — the ones that would actually change whether you pursue this deal.\n\n"
         "Prioritize (in order of importance):\n"
         "1. Revenue / EBITDA / margin claims with specific numbers\n"
         "2. Market size and growth rate claims\n"
@@ -530,9 +533,13 @@ async def analyze_cim(
     target_sectors: str = Form(default=""),
     geography: str = Form(default=""),
 ):
+    start_total = time.time()
+    print(f"[TIMING] Analysis started")
+
     # Step 1: read and extract text from all files
     files_bytes = [(f.filename or f"document_{i+1}.pdf", await f.read()) for i, f in enumerate(files)]
     documents = extract_all_documents_text(files_bytes)
+    print(f"[TIMING] PDF extraction: {time.time() - start_total:.1f}s")
 
     primary_filename = files_bytes[0][0]
     primary_text = documents[primary_filename]
@@ -540,29 +547,44 @@ async def analyze_cim(
     # Build criteria context (empty string if no criteria provided)
     criteria_context = build_criteria_context(min_ebitda, deal_size_range, target_sectors, geography, sector)
 
-    # Step 2: extract claims from primary CIM
-    claims = extract_claims(primary_text, sector, criteria_context)
+    # Step 2: extract claims from primary CIM (truncated to keep Claude fast)
+    claims = extract_claims(primary_text[:15000], sector, criteria_context)
+    print(f"[TIMING] Claims extraction: {time.time() - start_total:.1f}s")
 
-    # Step 3: search + analyze each claim
-    analyzed_claims = []
-    for claim in claims:
-        if claim.get("verifiable"):
-            search_results = search_claim(claim["claim"])
-            analysis = analyze_claim(claim, search_results, sector)
-            analyzed_claims.append({**claim, **analysis})
+    # Step 3: search + analyze each claim concurrently using a thread pool
+    # (Tavily and Claude SDK are sync — run them in parallel threads)
+    def search_and_analyze(claim: dict) -> dict:
+        search_results = search_claim(claim["claim"])
+        analysis = analyze_claim(claim, search_results, sector)
+        return {**claim, **analysis}
 
-    # Step 4: overall assessment
-    assessment = get_overall_assessment(analyzed_claims, sector, criteria_context)
+    verifiable_claims = [c for c in claims if c.get("verifiable")]
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = [loop.run_in_executor(executor, search_and_analyze, claim) for claim in verifiable_claims]
+        analyzed_claims = list(await asyncio.gather(*futures))
+    print(f"[TIMING] Web verification ({len(verifiable_claims)} claims): {time.time() - start_total:.1f}s")
+
+    combined_text = assemble_document_text(documents, char_limit=80000)
+
+    # Step 4 + 6: overall assessment and chart data in parallel
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        assessment_future = loop.run_in_executor(
+            executor, get_overall_assessment, analyzed_claims, sector, criteria_context
+        )
+        charts_future = loop.run_in_executor(
+            executor, extract_financial_charts_data, primary_text[:15000], sector
+        )
+        assessment, charts_data = await asyncio.gather(assessment_future, charts_future)
+    print(f"[TIMING] Overall assessment + charts: {time.time() - start_total:.1f}s")
 
     # Step 5: cross-document conflict detection (only with multiple files)
     cross_document_conflicts = []
     if len(files_bytes) > 1:
         cross_document_conflicts = find_cross_document_conflicts(documents, sector)
+        print(f"[TIMING] Cross-doc conflicts: {time.time() - start_total:.1f}s")
 
-    combined_text = assemble_document_text(documents, char_limit=80000)
-
-    # Step 6: extract chart data (use raw per-doc text to avoid boundary headers skewing numbers)
-    charts_data = extract_financial_charts_data(primary_text[:15000], sector)
+    print(f"[TIMING] Total: {time.time() - start_total:.1f}s")
 
     return {
         "assessment": assessment,
@@ -778,7 +800,7 @@ async def extract_document(file: UploadFile = File(...)):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "timestamp": time.time()}
 
 
 @app.post("/chat")
