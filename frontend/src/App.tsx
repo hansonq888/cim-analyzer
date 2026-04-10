@@ -410,7 +410,7 @@ function UploadZone({
             <div style={{ width: 1, height: 22, background: "#e5e7eb" }} />
           </>
         )}
-        <img src={`${process.env.PUBLIC_URL}/sagard.svg`} alt="Sagard" style={{ height: 26 }} />
+        <span style={{ fontFamily: FONT_STACK, fontSize: 13, fontWeight: 600, color: NAVY }}>CIM Analyzer</span>
         {dealName && (
           <>
             <div style={{ width: 1, height: 22, background: "#e5e7eb" }} />
@@ -1130,7 +1130,7 @@ function buildICBrief(
 
   <div class="doc-header">
     <div>
-      <div class="wordmark">SAGARD</div>
+      <div class="wordmark">CIM ANALYZER</div>
       <div class="doc-subtype">Investment Committee Brief</div>
     </div>
     <div class="header-meta">
@@ -1198,7 +1198,7 @@ function buildICBrief(
   </div>` : ''}
 
   <div class="footer">
-    <span>SAGARD CIM Analyzer — AI-assisted first-pass analysis. All investment decisions require human judgment.</span>
+    <span>CIM Analyzer — AI-assisted first-pass analysis. All investment decisions require human judgment.</span>
     <span>Page 1 of 2 &nbsp;·&nbsp; ${today}</span>
   </div>
 </div>
@@ -1207,7 +1207,7 @@ function buildICBrief(
 <div class="page page-break">
 
   <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">
-    <div style="font-size:10px;font-weight:800;color:#913d3e;letter-spacing:3px">SAGARD</div>
+    <div style="font-size:10px;font-weight:800;color:#913d3e;letter-spacing:3px">CIM ANALYZER</div>
     <div style="font-size:9px;color:#6b7280">${esc(dealTitle)} — continued</div>
   </div>
   <hr class="rule">
@@ -1269,7 +1269,7 @@ function buildICBrief(
   </div>` : ''}
 
   <div class="footer">
-    <span>SAGARD CIM Analyzer — AI-assisted first-pass analysis. All investment decisions require human judgment.</span>
+    <span>CIM Analyzer — AI-assisted first-pass analysis. All investment decisions require human judgment.</span>
     <span>Page 2 of 2 &nbsp;·&nbsp; ${today}</span>
   </div>
 </div>
@@ -2206,8 +2206,6 @@ function HomeScreen({ deals, loading, onNewDeal, onOpenDeal, onDeleteDeal }: {
       {/* Nav bar */}
       <div style={{ height: 52, background: '#fff', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 28px', flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-          <img src={process.env.PUBLIC_URL + '/sagard.svg'} height="28" alt="Sagard" style={{ display: 'block' }} />
-          <div style={{ width: 1, height: 20, background: '#e5e7eb' }} />
           <span style={{ fontFamily: FONT_STACK, fontWeight: 600, fontSize: 13, color: '#6b7280' }}>CIM Analyzer</span>
         </div>
         <button
@@ -2354,12 +2352,6 @@ function HomeScreen({ deals, loading, onNewDeal, onOpenDeal, onDeleteDeal }: {
         ) : (
           filteredDeals.length === 0 ? (
             <div style={{ textAlign: 'center', padding: '44px 20px 60px' }}>
-              <img
-                src={process.env.PUBLIC_URL + '/sagard.svg'}
-                height="28"
-                alt="Sagard"
-                style={{ opacity: 0.12, marginBottom: 14, display: 'block', marginLeft: 'auto', marginRight: 'auto' }}
-              />
               <p style={{ fontSize: 13, color: '#9ca3af', fontFamily: FONT_STACK, margin: '0 0 8px' }}>
                 No deals match your filters.
               </p>
@@ -2458,7 +2450,6 @@ function HomeScreen({ deals, loading, onNewDeal, onOpenDeal, onDeleteDeal }: {
         {/* Empty-state prompt below sample rows */}
         {showSamples && isDefaultFilters && (
           <div style={{ textAlign: 'center', padding: '36px 20px 60px', borderTop: '1px solid #e5e7eb' }}>
-            <img src={process.env.PUBLIC_URL + '/sagard.svg'} height="28" alt="Sagard" style={{ opacity: 0.12, marginBottom: 16, display: 'block', margin: '0 auto 16px' }} />
             <p style={{ fontSize: 13, color: '#9ca3af', fontFamily: FONT_STACK, margin: '0 0 20px' }}>These are sample deals. Add your first CIM to get started.</p>
             <button onClick={onNewDeal} style={{ background: RED, color: '#fff', border: 'none', borderRadius: 6, padding: '10px 24px', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK }}>
               + New Deal
@@ -3040,7 +3031,7 @@ function Results({
           >
             ← All Deals
           </button>
-          <img src="/sagard.svg" alt="Sagard" style={{ height: 28, width: 'auto', display: 'block', filter: 'brightness(0) invert(1)' }} />
+          <span style={{ color: '#fff', fontSize: 13, fontFamily: FONT_STACK, fontWeight: 600, letterSpacing: '0.4px' }}>CIM Analyzer</span>
           {dealName && (
             <span style={{ color: "rgba(255,255,255,0.85)", fontSize: 12, fontFamily: FONT_STACK, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 260 }}>
               {dealName}
@@ -3538,7 +3529,9 @@ export default function App() {
   // Persistence
   const {
     loadDeals, loadDeal, createDeal, saveDeal,
-    saveDocument, deleteDocument, saveAnalysis, saveChatMessage, deleteDeal, saveError,
+    saveDocument, deleteDocument, saveAnalysis, saveChatMessage, deleteDeal,
+    uploadFilesToStorage, downloadFilesFromStorage, deleteFileFromStorage,
+    saveError,
   } = useDealPersistence();
 
   // ── View routing ─────────────────────────────────────────────
@@ -3668,7 +3661,10 @@ export default function App() {
       }
       if (loaded.documents.length > 0) {
         const memoryCached = dealFilesCache.current.get(deal.id) ?? [];
-        const cachedFiles = memoryCached.length > 0 ? memoryCached : (await loadFilesFromIDB(deal.id) ?? []);
+        const idbFiles = memoryCached.length > 0 ? memoryCached : (await loadFilesFromIDB(deal.id) ?? []);
+        const cachedFiles = idbFiles.length > 0
+          ? idbFiles
+          : await downloadFilesFromStorage(deal.id, loaded.documents.map(d => d.filename));
         if (cachedFiles.length > 0) {
           // Restore files into memory cache and uploadedFiles — Results useEffect
           // will create object URLs and show the real PDF viewer
@@ -3749,8 +3745,11 @@ export default function App() {
   }, [activeDealId, saveDocument]);
 
   const handleRemoveDocument = useCallback(async (filename: string) => {
-    // 1. Remove from Supabase
-    if (activeDealId) await deleteDocument(activeDealId, filename);
+    // 1. Remove from Supabase (DB row + storage file)
+    if (activeDealId) {
+      await deleteDocument(activeDealId, filename);
+      deleteFileFromStorage(activeDealId, filename);
+    }
     // 2. Remove from uploadedFiles state (drives the viewer)
     setUploadedFiles(prev => {
       const updated = prev.filter(f => f.name !== filename);
@@ -3842,8 +3841,11 @@ export default function App() {
       setDocumentsText(data.documents_text ?? {});
       setChartsData(data.charts_data ?? null);
 
-      // Cache files in IDB so PDFs survive page refreshes
-      if (activeDealId) saveFilesToIDB(activeDealId, stagedFiles);
+      // Cache files locally (IDB) and in Supabase Storage
+      if (activeDealId) {
+        saveFilesToIDB(activeDealId, stagedFiles);
+        uploadFilesToStorage(activeDealId, stagedFiles);
+      }
 
       // Persist
       if (activeDealId) {

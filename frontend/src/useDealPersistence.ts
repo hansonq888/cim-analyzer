@@ -218,6 +218,12 @@ export function useDealPersistence() {
 
   const deleteDeal = useCallback(async (dealId: string) => {
     await safe(async () => {
+      // Delete files from storage bucket first
+      const { data: files } = await supabase!.storage.from('deal-files').list(dealId);
+      if (files && files.length > 0) {
+        const paths = files.map(f => `${dealId}/${f.name}`);
+        await supabase!.storage.from('deal-files').remove(paths);
+      }
       // Delete child rows first (FK constraints), then the deal itself
       await supabase!.from('deal_chat_messages').delete().eq('deal_id', dealId);
       await supabase!.from('deal_analyses').delete().eq('deal_id', dealId);
@@ -226,6 +232,41 @@ export function useDealPersistence() {
       if (error) throw error;
     });
   }, [safe]);
+
+  // ── Storage ──────────────────────────────────────────────────
+
+  const uploadFilesToStorage = useCallback(async (dealId: string, files: File[]) => {
+    if (!supabase || !files.length) return;
+    await Promise.all(files.map(async (file) => {
+      const path = `${dealId}/${file.name}`;
+      const { error } = await supabase!.storage
+        .from('deal-files')
+        .upload(path, file, { upsert: true });
+      if (error) console.error('[Storage] upload failed:', file.name, error.message);
+    }));
+  }, []);
+
+  const downloadFilesFromStorage = useCallback(async (dealId: string, filenames: string[]): Promise<File[]> => {
+    if (!supabase || !filenames.length) return [];
+    const results = await Promise.all(filenames.map(async (filename) => {
+      const path = `${dealId}/${filename}`;
+      const { data, error } = await supabase!.storage.from('deal-files').download(path);
+      if (error || !data) {
+        console.warn('[Storage] download failed:', filename, error?.message);
+        return null;
+      }
+      return new File([data], filename, { type: data.type });
+    }));
+    return results.filter((f): f is File => f !== null);
+  }, []);
+
+  const deleteFileFromStorage = useCallback(async (dealId: string, filename: string) => {
+    if (!supabase) return;
+    const { error } = await supabase!.storage
+      .from('deal-files')
+      .remove([`${dealId}/${filename}`]);
+    if (error) console.warn('[Storage] delete failed:', filename, error.message);
+  }, []);
 
   const saveChatMessage = useCallback(async (dealId: string, message: {
     role: string;
@@ -259,6 +300,10 @@ export function useDealPersistence() {
     saveAnalysis,
     saveChatMessage,
     deleteDeal,
+    // Storage
+    uploadFilesToStorage,
+    downloadFilesFromStorage,
+    deleteFileFromStorage,
     // UI state
     saveError,
   };
