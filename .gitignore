@@ -1,8 +1,32 @@
+# Environment variables (API keys — never commit these)
 .env
 .env.local
 .env.development
 .env.production
+
+# Python
 venv/
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Node / React
 node_modules/
+frontend/build/
+npm-debug.log*
+
+# OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Generated PDFs (local only)
+*.pdf

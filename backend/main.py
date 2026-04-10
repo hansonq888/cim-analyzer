@@ -321,7 +321,6 @@ def search_claim(claim: str) -> list:
 
 def analyze_claim(claim: dict, search_results: list, sector: str) -> dict:
     lens = STRATEGY_LENS.get(sector, STRATEGY_LENS["Private Equity"])
-
     try:
         response = claude.messages.create(
             model="claude-sonnet-4-5",
@@ -620,7 +619,9 @@ async def analyze_cim(
     verifiable_claims = [c for c in claims if c.get("verifiable")]
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor(max_workers=6) as executor:
+        # sends claims into 6 threads each to do
         futures = [loop.run_in_executor(executor, search_and_analyze, claim) for claim in verifiable_claims]
+        #waits for all results to finish, collects them into a list
         analyzed_claims = list(await asyncio.gather(*futures))
     print(f"[TIMING] Web verification ({len(verifiable_claims)} claims): {time.time() - start_total:.1f}s")
 
