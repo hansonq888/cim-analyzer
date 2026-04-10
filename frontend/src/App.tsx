@@ -3762,7 +3762,7 @@ export default function App() {
     });
     // 4. Also remove from savedDocEntries in case IDB was empty (DB-only path)
     setSavedDocEntries(prev => prev.filter(d => d.name !== filename));
-  }, [activeDealId, deleteDocument]);
+  }, [activeDealId, deleteDocument, deleteFileFromStorage]);
 
   // ── File staging ─────────────────────────────────────────────
   const handleAddFiles = useCallback((incoming: File[]) => {
