@@ -81,9 +81,10 @@ async function deleteFilesFromIDB(dealId: string): Promise<void> {
 }
 
 // ── Brand ────────────────────────────────────────────────────
-const RED    = "#913d3e";
-const NAVY   = "#1a1a1a";
-const OFFWHITE = "#f8f6f3";
+const RED    = "#4f46e5";
+const NAVY   = "#111827";
+const OFFWHITE = "#f8fafc";
+const APP_TITLE = "DealSignal AI";
 
 // ── Types ────────────────────────────────────────────────────
 interface Source { title: string; url: string; }
@@ -295,6 +296,10 @@ const GLOBAL_STYLE = `
   .react-pdf__Page { display: block !important; }
   input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
   input, select, textarea, button { font-family: inherit; }
+  button { transition: all 0.15s ease; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 999px; border: 2px solid #f8fafc; }
+  ::-webkit-scrollbar-track { background: transparent; }
   @keyframes spin { to { transform: rotate(360deg); } }
   @keyframes pulse { 0%, 100% { opacity: 0.3; transform: scale(0.8); } 50% { opacity: 1; transform: scale(1); } }
   @keyframes stepOn { from { opacity: 0.4; } to { opacity: 1; } }
@@ -401,7 +406,7 @@ function UploadZone({
       <style>{GLOBAL_STYLE}</style>
 
       {/* Nav bar */}
-      <div style={{ height: 52, background: "#fff", borderBottom: "1px solid #e5e7eb", display: "flex", alignItems: "center", padding: "0 24px", gap: 14, flexShrink: 0 }}>
+      <div style={{ height: 56, background: "#fff", borderBottom: "1px solid #e5e7eb", display: "flex", alignItems: "center", padding: "0 28px", gap: 14, flexShrink: 0, boxShadow: "0 1px 0 rgba(15,23,42,0.03)" }}>
         {onBackToHome && (
           <>
             <button onClick={onBackToHome} style={{ background: "none", border: "none", color: "#6b7280", fontSize: 13, cursor: "pointer", fontFamily: FONT_STACK, padding: 0, display: "flex", alignItems: "center", gap: 4, fontWeight: 500 }}>
@@ -410,7 +415,10 @@ function UploadZone({
             <div style={{ width: 1, height: 22, background: "#e5e7eb" }} />
           </>
         )}
-        <span style={{ fontFamily: FONT_STACK, fontSize: 13, fontWeight: 600, color: NAVY }}>CIM Analyzer</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ width: 8, height: 8, borderRadius: "50%", background: RED, boxShadow: "0 0 0 4px rgba(79,70,229,0.12)" }} />
+          <span style={{ fontFamily: FONT_STACK, fontSize: 13, fontWeight: 700, color: NAVY, letterSpacing: "0.2px" }}>{APP_TITLE}</span>
+        </div>
         {dealName && (
           <>
             <div style={{ width: 1, height: 22, background: "#e5e7eb" }} />
@@ -447,11 +455,11 @@ function UploadZone({
         </div>
       ) : (
         /* ── Main setup UI ── */
-        <div style={{ padding: "36px 40px", maxWidth: 980, margin: "0 auto" }}>
+        <div style={{ padding: "36px 40px", maxWidth: 1020, margin: "0 auto" }}>
           <p style={{ margin: "0 0 4px", fontSize: 24, fontWeight: 700, color: NAVY, fontFamily: FONT_STACK, letterSpacing: "-0.5px" }}>Deal Setup</p>
           <div style={{ borderBottom: "2px solid #e5e7eb", marginBottom: 28 }} />
 
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 40 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 32, background: "#fff", border: "1px solid #e5e7eb", borderRadius: 12, padding: 24, boxShadow: "0 8px 24px rgba(15,23,42,0.05)" }}>
 
             {/* Left: Documents */}
             <div>
@@ -460,7 +468,7 @@ function UploadZone({
                 {...getRootProps()}
                 style={{
                   border: `1px dashed ${isDragActive ? RED : "#e5e7eb"}`,
-                  borderRadius: 6, padding: files.length ? "16px 20px" : "32px 20px",
+                  borderRadius: 10, padding: files.length ? "16px 20px" : "32px 20px",
                   textAlign: "center", background: isDragActive ? "#fdf5f5" : "#fff",
                   cursor: "pointer", transition: "all 0.15s", marginBottom: files.length ? 10 : 0,
                 }}
@@ -481,7 +489,7 @@ function UploadZone({
                     const badge = getTypeBadgeColor(ftype);
                     const isPrimary = i === 0;
                     return (
-                      <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "#fff", border: `1px solid ${isPrimary ? RED : "#e5e7eb"}`, borderLeft: `3px solid ${isPrimary ? RED : "#e5e7eb"}`, borderRadius: 6, padding: "8px 12px", marginBottom: 5 }}>
+                      <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, background: "#fff", border: `1px solid ${isPrimary ? RED : "#e5e7eb"}`, borderLeft: `3px solid ${isPrimary ? RED : "#e5e7eb"}`, borderRadius: 10, padding: "9px 12px", marginBottom: 6 }}>
                         <span style={{ fontSize: 9, fontWeight: 700, padding: "2px 5px", borderRadius: 3, background: badge.bg, color: badge.color, fontFamily: FONT_STACK, textTransform: "uppercase" as const, flexShrink: 0 }}>
                           {ftype.toUpperCase()}
                         </span>
@@ -1065,7 +1073,7 @@ function buildICBrief(
   }
   /* Header */
   .doc-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
-  .wordmark { font-size: 20px; font-weight: 800; color: #913d3e; letter-spacing: 4px; line-height: 1; }
+  .wordmark { font-size: 20px; font-weight: 700; color: #111827; letter-spacing: 1px; line-height: 1; }
   .doc-subtype { font-size: 8px; font-weight: 700; letter-spacing: 2.5px; text-transform: uppercase; color: #6b7280; margin-top: 4px; }
   .header-meta { text-align: right; font-size: 10px; color: #6b7280; line-height: 1.7; }
   .header-meta .deal-name { font-size: 13px; font-weight: 700; color: #1a1a1a; display: block; margin-bottom: 2px; }
@@ -1130,7 +1138,7 @@ function buildICBrief(
 
   <div class="doc-header">
     <div>
-      <div class="wordmark">CIM ANALYZER</div>
+      <div class="wordmark">Deal Analyzer</div>
       <div class="doc-subtype">Investment Committee Brief</div>
     </div>
     <div class="header-meta">
@@ -1198,7 +1206,7 @@ function buildICBrief(
   </div>` : ''}
 
   <div class="footer">
-    <span>CIM Analyzer — AI-assisted first-pass analysis. All investment decisions require human judgment.</span>
+    <span>Deal Analyzer — AI-assisted first-pass analysis. All investment decisions require human judgment.</span>
     <span>Page 1 of 2 &nbsp;·&nbsp; ${today}</span>
   </div>
 </div>
@@ -1207,7 +1215,7 @@ function buildICBrief(
 <div class="page page-break">
 
   <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px">
-    <div style="font-size:10px;font-weight:800;color:#913d3e;letter-spacing:3px">CIM ANALYZER</div>
+    <div style="font-size:10px;font-weight:700;color:#111827;letter-spacing:1px">Deal Analyzer</div>
     <div style="font-size:9px;color:#6b7280">${esc(dealTitle)} — continued</div>
   </div>
   <hr class="rule">
@@ -1269,7 +1277,7 @@ function buildICBrief(
   </div>` : ''}
 
   <div class="footer">
-    <span>CIM Analyzer — AI-assisted first-pass analysis. All investment decisions require human judgment.</span>
+    <span>Deal Analyzer — AI-assisted first-pass analysis. All investment decisions require human judgment.</span>
     <span>Page 2 of 2 &nbsp;·&nbsp; ${today}</span>
   </div>
 </div>
@@ -2206,7 +2214,10 @@ function HomeScreen({ deals, loading, onNewDeal, onOpenDeal, onDeleteDeal }: {
       {/* Nav bar */}
       <div style={{ height: 52, background: '#fff', borderBottom: '1px solid #e5e7eb', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 28px', flexShrink: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-          <span style={{ fontFamily: FONT_STACK, fontWeight: 600, fontSize: 13, color: '#6b7280' }}>CIM Analyzer</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: RED, boxShadow: "0 0 0 4px rgba(79,70,229,0.12)" }} />
+            <span style={{ fontFamily: FONT_STACK, fontWeight: 700, fontSize: 13, color: NAVY, letterSpacing: "0.2px" }}>{APP_TITLE}</span>
+          </div>
         </div>
         <button
           onClick={onNewDeal}
@@ -3012,7 +3023,7 @@ function Results({
   );
 
   const panelBtnBase: React.CSSProperties = {
-    padding: '4px 10px', border: '1px solid #e5e7eb', borderRadius: 8,
+    padding: '6px 12px', border: '1px solid #e5e7eb', borderRadius: 10,
     fontSize: 11, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK,
     whiteSpace: 'nowrap',
   };
@@ -3022,7 +3033,7 @@ function Results({
       <style>{GLOBAL_STYLE}</style>
 
       {/* Nav bar */}
-      <div style={{ height: 48, background: RED, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 16px", flexShrink: 0 }}>
+      <div style={{ height: 52, background: RED, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 16px", flexShrink: 0, boxShadow: "0 1px 0 rgba(255,255,255,0.15) inset" }}>
         {/* Left: back button + wordmark */}
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <button
@@ -3031,7 +3042,10 @@ function Results({
           >
             ← All Deals
           </button>
-          <span style={{ color: '#fff', fontSize: 13, fontFamily: FONT_STACK, fontWeight: 600, letterSpacing: '0.4px' }}>CIM Analyzer</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#fff", opacity: 0.95 }} />
+            <span style={{ color: '#fff', fontSize: 13, fontFamily: FONT_STACK, fontWeight: 700, letterSpacing: '0.3px' }}>{APP_TITLE}</span>
+          </div>
           {dealName && (
             <span style={{ color: "rgba(255,255,255,0.85)", fontSize: 12, fontFamily: FONT_STACK, fontWeight: 500, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 260 }}>
               {dealName}
@@ -3138,10 +3152,10 @@ function Results({
         <DragDivider onDrag={handleMainDividerDrag} dark={false} />
 
         {/* Right: Analysis — tabbed dashboard */}
-        <div style={{ width: rightPanelWidth, flexShrink: 0, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+        <div style={{ width: rightPanelWidth, flexShrink: 0, display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden', background: '#ffffff' }}>
 
           {/* Panel header — company name + verdict pill + actions */}
-          <div style={{ height: 48, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 16px', background: '#fff', borderBottom: '1px solid #e5e7eb', flexShrink: 0 }}>
+          <div style={{ height: 52, display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 16px', background: '#fff', borderBottom: '1px solid #e5e7eb', flexShrink: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, flex: 1, overflow: 'hidden' }}>
               <span style={{ fontSize: 13, fontWeight: 600, color: '#1a1a1a', fontFamily: FONT_STACK, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                 {companyName}
@@ -3160,7 +3174,7 @@ function Results({
           </div>
 
           {/* Tab bar */}
-          <div style={{ background: '#f8f6f3', borderBottom: '1px solid #e5e7eb', padding: '0 16px', height: 40, display: 'flex', alignItems: 'flex-end', flexShrink: 0 }}>
+          <div style={{ background: '#f8fafc', borderBottom: '1px solid #e5e7eb', padding: '0 16px', height: 42, display: 'flex', alignItems: 'flex-end', flexShrink: 0 }}>
             {(['overview', 'claims', 'conflicts', 'chat', 'comps'] as ResultTab[]).map(tab => {
               let label: string;
               if (tab === 'conflicts') label = `CONFLICTS${conflicts.length > 0 ? ` (${conflicts.length})` : ''}`;
